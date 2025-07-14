@@ -1,0 +1,16 @@
+[project]
+name = "distillite"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "accelerate>=1.8.1",
+    "black>=25.1.0",
+    "gputil>=1.4.0",
+    "huggingface-hub>=0.33.4",
+    "isort>=6.0.1",
+    "psutil>=7.0.0",
+    "torch>=2.7.1",
+    "transformers>=4.53.2",
+]
