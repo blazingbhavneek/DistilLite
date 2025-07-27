@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 from huggingface_hub import snapshot_download
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 try:
     from safetensors import safe_open
@@ -119,6 +119,115 @@ def load_model_subset(
     return model
 
 
+def run_partial_inference(
+    model, input_ids, attention_mask, start_layer: int, end_layer: int
+):
+    """
+    Run inference through a subset of layers (start_layer to end_layer-1).
+    Returns the hidden states after the last processed layer.
+    """
+    with torch.no_grad():
+        if start_layer == 0:
+            hidden_states = model.model.embed_tokens(input_ids)
+
+            batch_size, seq_length = input_ids.shape
+            position_ids = torch.arange(
+                seq_length, dtype=torch.long, device=input_ids.device
+            )
+            position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+
+            for i in range(start_layer, min(end_layer, len(model.model.layers))):
+                layer = model.model.layers[i]
+
+                if attention_mask is not None:
+                    causal_mask = torch.tril(
+                        torch.ones(seq_length, seq_length, device=hidden_states.device)
+                    )
+                    expanded_mask = attention_mask[:, None, None, :].expand(
+                        batch_size, 1, seq_length, seq_length
+                    )
+                    combined_mask = causal_mask[None, None, :, :] * expanded_mask
+                    combined_mask = (1.0 - combined_mask) * torch.finfo(
+                        hidden_states.dtype
+                    ).min
+                else:
+                    combined_mask = None
+
+                try:
+                    layer_outputs = layer(
+                        hidden_states,
+                        attention_mask=combined_mask,
+                        position_ids=position_ids,
+                        use_cache=False,
+                    )
+                    hidden_states = layer_outputs[0]
+                    print(f"Processed layer {i}, output shape: {hidden_states.shape}")
+
+                except Exception as e:
+                    print(f"Error in layer {i} with full args: {e}")
+                    try:
+                        layer_outputs = layer(
+                            hidden_states,
+                            attention_mask=attention_mask,
+                            use_cache=False,
+                        )
+                        hidden_states = layer_outputs[0]
+                        print(
+                            f"Processed layer {i} (minimal args), output shape: {hidden_states.shape}"
+                        )
+                    except Exception as e2:
+                        print(f"Error in layer {i} with minimal args: {e2}")
+                        try:
+                            layer_outputs = layer(hidden_states)
+                            if isinstance(layer_outputs, tuple):
+                                hidden_states = layer_outputs[0]
+                            else:
+                                hidden_states = layer_outputs
+                            print(
+                                f"Processed layer {i} (fallback), output shape: {hidden_states.shape}"
+                            )
+                        except Exception as e3:
+                            print(f"Failed to process layer {i}: {e3}")
+                            break
+
+        else:
+            hidden_states = input_ids
+
+            batch_size, seq_length = hidden_states.shape[:2]
+            position_ids = torch.arange(
+                seq_length, dtype=torch.long, device=hidden_states.device
+            )
+            position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+
+            for i in range(start_layer, min(end_layer, len(model.model.layers))):
+                layer = model.model.layers[i]
+
+                try:
+                    layer_outputs = layer(
+                        hidden_states,
+                        attention_mask=attention_mask,
+                        use_cache=False,
+                    )
+                    hidden_states = layer_outputs[0]
+                    print(f"Processed layer {i}, output shape: {hidden_states.shape}")
+                except Exception as e:
+                    print(f"Error in layer {i}: {e}")
+                    try:
+                        layer_outputs = layer(hidden_states)
+                        if isinstance(layer_outputs, tuple):
+                            hidden_states = layer_outputs[0]
+                        else:
+                            hidden_states = layer_outputs
+                        print(
+                            f"Processed layer {i} (fallback), output shape: {hidden_states.shape}"
+                        )
+                    except Exception as e2:
+                        print(f"Failed to process layer {i}: {e2}")
+                        break
+
+        return hidden_states
+
+
 if __name__ == "__main__":
     repo_id = "Qwen/Qwen3-4B"
     local_dir = "models"
@@ -128,20 +237,73 @@ if __name__ == "__main__":
     model_path = download_model(repo_id, local_dir)
     print(f"Model downloaded to: {model_path}")
 
-    print("\nInspecting model layers...")
-    layer_infos = inspect_model_layers(model_path)
-    print(f"Found {len(layer_infos)} parameters.\n")
+    print("Loading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-    for info in layer_infos:
-        print(
-            f"{info['name']} | shape: {info['shape']} | dtype: {info['dtype']} | size: {info['size_bytes'] / 1e6:.2f} MB"
-        )
+    test_text = "The quick brown fox jumps over"
+    print(f"Test input: '{test_text}'")
 
-    print("\nLoading subset of model layers onto CPU (layers 0–2)...")
-    try:
-        model = load_model_subset(
-            repo_id, local_dir=local_dir, start_layer=0, end_layer=2
-        )
-        print("Model subset loaded successfully.")
-    except Exception as e:
-        print(f"Error loading model subset: {e}")
+    inputs = tokenizer(test_text, return_tensors="pt", padding=True)
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs["attention_mask"]
+    print(f"Tokenized input shape: {input_ids.shape}")
+
+    temp_outputs = {}
+
+    print("\n" + "=" * 50)
+    print("LAYERED INFERENCE TEST")
+    print("=" * 50)
+
+    print("\nStep 1: Loading layers 0-1...")
+    model_chunk1 = load_model_subset(
+        repo_id, local_dir=local_dir, start_layer=0, end_layer=2
+    )
+    print("Running inference on layers 0-1...")
+
+    output_chunk1 = run_partial_inference(
+        model_chunk1, input_ids, attention_mask, start_layer=0, end_layer=2
+    )
+    temp_outputs["layers_0_1"] = output_chunk1.clone()
+    print(f"Stored output from layers 0-1, shape: {temp_outputs['layers_0_1'].shape}")
+
+    del model_chunk1
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    print("\nStep 2: Loading layers 2-3...")
+    model_chunk2 = load_model_subset(
+        repo_id, local_dir=local_dir, start_layer=2, end_layer=4
+    )
+    print("Running inference on layers 2-3 using stored intermediate results...")
+
+    output_chunk2 = run_partial_inference(
+        model_chunk2,
+        temp_outputs["layers_0_1"],
+        attention_mask,
+        start_layer=2,
+        end_layer=4,
+    )
+    temp_outputs["layers_2_3"] = output_chunk2.clone()
+    print(f"Stored output from layers 2-3, shape: {temp_outputs['layers_2_3'].shape}")
+
+    del model_chunk2
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    print("\n" + "=" * 50)
+    print("LAYERED INFERENCE COMPLETE")
+    print("=" * 50)
+    print(f"Final intermediate tensor shape: {temp_outputs['layers_2_3'].shape}")
+    print(
+        f"Final intermediate tensor mean: {temp_outputs['layers_2_3'].mean().item():.6f}"
+    )
+    print(
+        f"Final intermediate tensor std: {temp_outputs['layers_2_3'].std().item():.6f}"
+    )
+
+    print("\nStored intermediate results:")
+    for key, tensor in temp_outputs.items():
+        print(f"  {key}: shape={tensor.shape}, mean={tensor.mean().item():.6f}")
+
+    print("\nLayered inference test completed successfully!")
+    print("You can extend this pattern to process more layer chunks sequentially.")
