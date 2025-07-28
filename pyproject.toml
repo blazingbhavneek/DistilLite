@@ -8,6 +8,7 @@ dependencies = [
     "accelerate>=1.8.1",
     "black>=25.1.0",
     "gputil>=1.4.0",
+    "h5py>=3.14.0",
     "huggingface-hub>=0.33.4",
     "isort>=6.0.1",
     "pandas>=2.3.1",

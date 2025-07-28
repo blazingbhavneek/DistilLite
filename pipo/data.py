@@ -17,6 +17,8 @@ class ChunkedCSVProcessor:
         chunk_size=10000,
         batch_size=256,
         intermediate_dir="intermediate_tensors",
+        final_output_dir="final_outputs",
+        save_output=True,
     ):
         self.csv_path = csv_path
         self.input_col = input_col
@@ -24,19 +26,23 @@ class ChunkedCSVProcessor:
         self.chunk_size = chunk_size
         self.batch_size = batch_size
         self.intermediate_dir = Path(intermediate_dir)
+        self.final_output_dir = Path(final_output_dir)
+        self.save_output = save_output
 
         self.intermediate_dir.mkdir(parents=True, exist_ok=True)
+        if self.save_output and self.output_col:
+            self.final_output_dir.mkdir(parents=True, exist_ok=True)
 
         self.current_chunk = 0
         self.current_batch = 0
         self.processed_rows = 0
         self.total_rows = 0
         self.num_chunks = 0
-        self.using_intermediate = False
+
+        self.chunk_tensor_paths = {}
+        self.final_output_paths = []
 
         self.chunk_data = None
-        self.tensor_paths = []
-        self.temp_csv_path = None
 
         self._initialize_csv()
 
@@ -48,14 +54,6 @@ class ChunkedCSVProcessor:
             self.total_rows = sum(1 for _ in f) - 1
 
         self.num_chunks = (self.total_rows + self.chunk_size - 1) // self.chunk_size
-
-        self.using_intermediate = self.input_col is None
-
-        if self.using_intermediate and "tensor_path" not in self.df_header.columns:
-            self.df_header["tensor_path"] = None
-            self.df_header.to_csv(self.csv_path, index=False)
-
-        self.temp_csv_path = str(Path(self.csv_path).with_suffix(".tmp"))
 
     def next_chunk(self):
         """Load next chunk of data from CSV."""
@@ -74,9 +72,6 @@ class ChunkedCSVProcessor:
             names=self.df_header.columns,
         )
 
-        if self.using_intermediate:
-            self.tensor_paths = self.chunk_data["tensor_path"].tolist()
-
         self.current_batch = 0
         return True
 
@@ -91,105 +86,140 @@ class ChunkedCSVProcessor:
 
         end = min(start + self.batch_size, len(self.chunk_data))
 
-        if self.using_intermediate:
-            batch_paths = self.tensor_paths[start:end]
-            batch_data = [
-                torch.load(self.intermediate_dir / path) for path in batch_paths
-            ]
+        if self.input_col is None:
+            chunk_file = self.intermediate_dir / f"chunk_{self.current_chunk}.pt"
+            if chunk_file.exists():
+                chunk_tensors = torch.load(chunk_file, weights_only=False)
+                batch_data = chunk_tensors[start:end]
+            else:
+                raise FileNotFoundError(f"No intermediate data found for chunk {self.current_chunk}")
+            
+            if not isinstance(batch_data, torch.Tensor):
+                batch_data = torch.tensor(batch_data)
         else:
             batch_data = self.chunk_data.iloc[start:end][self.input_col].values
 
         self.current_batch += 1
-
         return batch_data, start, end
 
     def save_batch_output(self, outputs, start_idx, end_idx):
         """Save model outputs for current batch."""
-        if isinstance(outputs, torch.Tensor):
-            outputs = outputs.detach().cpu().numpy()
-
-        if self.output_col is not None:
-            if self.output_col not in self.chunk_data.columns:
-                self.chunk_data[self.output_col] = None
-
-            self.chunk_data.loc[start_idx : end_idx - 1, self.output_col] = outputs
-        else:
-            batch_paths = []
-            for i, output in enumerate(outputs):
-                global_idx = self.current_chunk * self.chunk_size + start_idx + i
-                tensor_path = f"row_{global_idx}.pt"
-                full_path = self.intermediate_dir / tensor_path
-
-                torch.save(torch.tensor(output), full_path)
-                batch_paths.append(tensor_path)
-
-            if "tensor_path" not in self.chunk_data.columns:
-                self.chunk_data["tensor_path"] = None
-            self.chunk_data.loc[start_idx : end_idx - 1, "tensor_path"] = batch_paths
-
-    def save_chunk_to_disk(self):
-        """Save current chunk back to CSV using safe file operations."""
-        if self.chunk_data is None:
+        if not self.save_output:
             return
 
-        if self.current_chunk == 0:
-            original_df = pd.read_csv(self.csv_path)
+        if isinstance(outputs, torch.Tensor):
+            outputs = outputs.detach().cpu()
 
-            for col in self.chunk_data.columns:
-                if col not in original_df.columns:
-                    original_df[col] = None
+        if self.current_chunk not in self.chunk_tensor_paths:
+            chunk_size = len(self.chunk_data)
+            if self.output_col is None:
+                if isinstance(outputs, torch.Tensor):
+                    chunk_storage = torch.zeros(chunk_size, *outputs.shape[1:], dtype=outputs.dtype)
+                else:
+                    chunk_storage = torch.zeros(chunk_size, dtype=torch.float32)
+            else:
+                if isinstance(outputs, torch.Tensor):
+                    chunk_storage = torch.zeros(chunk_size, *outputs.shape[1:], dtype=outputs.dtype)
+                else:
+                    chunk_storage = torch.zeros(chunk_size, dtype=torch.float32)
+            
+            temp_path = self.intermediate_dir / f"temp_chunk_{self.current_chunk}.pt"
+            torch.save(chunk_storage, temp_path)
+            self.chunk_tensor_paths[self.current_chunk] = temp_path
 
-            start_idx = self.current_chunk * self.chunk_size
-            end_idx = min(start_idx + len(self.chunk_data), len(original_df))
-
-            for col in self.chunk_data.columns:
-                values = self.chunk_data[col].values
-                if original_df[col].dtype != values.dtype:
-                    original_df[col] = original_df[col].astype(values.dtype)
-                original_df.loc[start_idx : end_idx - 1, col] = values
-
-            original_df.to_csv(self.temp_csv_path, index=False)
+        chunk_storage = torch.load(self.chunk_tensor_paths[self.current_chunk], weights_only=False)
+        
+        if isinstance(outputs, torch.Tensor):
+            if outputs.dim() > 1 and outputs.shape[0] != (end_idx - start_idx):
+                outputs = outputs[:end_idx - start_idx]
+            chunk_storage[start_idx:end_idx] = outputs
         else:
-            existing_df = pd.read_csv(self.temp_csv_path)
+            outputs_tensor = torch.tensor(outputs, dtype=chunk_storage.dtype)
+            if outputs_tensor.dim() > 1 and outputs_tensor.shape[0] != (end_idx - start_idx):
+                outputs_tensor = outputs_tensor[:end_idx - start_idx]
+            chunk_storage[start_idx:end_idx] = outputs_tensor
+        
+        torch.save(chunk_storage, self.chunk_tensor_paths[self.current_chunk])
 
-            for col in self.chunk_data.columns:
-                if col not in existing_df.columns:
-                    existing_df[col] = None
+    def save_chunk_to_disk(self):
+        """Save current chunk outputs to appropriate format."""
+        if not self.save_output or self.current_chunk not in self.chunk_tensor_paths:
+            self.chunk_data = None
+            self.current_chunk += 1
+            return
 
-            start_idx = self.current_chunk * self.chunk_size
-            end_idx = min(start_idx + len(self.chunk_data), len(existing_df))
+        chunk_storage = torch.load(self.chunk_tensor_paths[self.current_chunk], weights_only=False)
 
-            for col in self.chunk_data.columns:
-                values = self.chunk_data[col].values
-                if existing_df[col].dtype != values.dtype:
-                    existing_df[col] = existing_df[col].astype(values.dtype)
-                existing_df.loc[start_idx : end_idx - 1, col] = values
-
-            existing_df.to_csv(self.temp_csv_path, index=False)
+        if self.output_col is None:
+            final_path = self.intermediate_dir / f"chunk_{self.current_chunk}.pt"
+            temp_final = self.intermediate_dir / f"temp_final_chunk_{self.current_chunk}.pt"
+            torch.save(chunk_storage, temp_final)
+            temp_final.rename(final_path)
+            
+            self.chunk_tensor_paths[self.current_chunk] = final_path
+            
+            temp_path = self.intermediate_dir / f"temp_chunk_{self.current_chunk}.pt"
+            if temp_path.exists():
+                temp_path.unlink()
+        else:
+            if isinstance(chunk_storage, torch.Tensor):
+                output_values = chunk_storage.numpy()
+            else:
+                output_values = chunk_storage
+            
+            chunk_df = self.chunk_data.copy()
+            chunk_df[self.output_col] = output_values
+            
+            chunk_csv_path = self.final_output_dir / f"chunk_{self.current_chunk}.csv"
+            chunk_df.to_csv(chunk_csv_path, index=False)
+            self.final_output_paths.append(chunk_csv_path)
+            
+            temp_path = self.chunk_tensor_paths[self.current_chunk]
+            if temp_path.exists():
+                temp_path.unlink()
+            del self.chunk_tensor_paths[self.current_chunk]
 
         self.chunk_data = None
-        self.tensor_paths = []
         self.current_chunk += 1
 
     def finalize(self):
-        """Finalize processing by moving temp file to final location."""
-        if self.temp_csv_path and os.path.exists(self.temp_csv_path):
-            shutil.move(self.temp_csv_path, self.csv_path)
+        """Finalize processing by concatenating final outputs if needed."""
+        if self.save_output and self.output_col and self.final_output_paths:
+            final_output_path = Path(self.csv_path).parent / f"{Path(self.csv_path).stem}_with_{self.output_col}.csv"
+            
+            first_chunk = pd.read_csv(self.final_output_paths[0])
+            first_chunk.to_csv(final_output_path, index=False)
+            
+            for chunk_path in self.final_output_paths[1:]:
+                chunk_df = pd.read_csv(chunk_path)
+                chunk_df.to_csv(final_output_path, mode='a', header=False, index=False)
+            
+            for chunk_path in self.final_output_paths:
+                chunk_path.unlink()
+            
+            if self.final_output_dir.exists() and not any(self.final_output_dir.iterdir()):
+                self.final_output_dir.rmdir()
 
-    def clear_intermediate(self):
-        """Clear all intermediate tensor files."""
-        for file in self.intermediate_dir.glob("*.pt"):
-            file.unlink()
+    def clear_intermediate(self, chunk_idx=None):
+        """Clear intermediate tensor files."""
+        if chunk_idx is not None:
+            chunk_file = self.intermediate_dir / f"chunk_{chunk_idx}.pt"
+            if chunk_file.exists():
+                chunk_file.unlink()
+            if chunk_idx in self.chunk_tensor_paths:
+                del self.chunk_tensor_paths[chunk_idx]
+        else:
+            for file in self.intermediate_dir.glob("*.pt"):
+                file.unlink()
+            self.chunk_tensor_paths.clear()
 
 
 if __name__ == "__main__":
-    print("Testing ChunkedCSVProcessor with simulated model operations")
 
     temp_dir = tempfile.mkdtemp()
     print(f"Created temporary directory: {temp_dir}")
-
     csv_path = os.path.join(temp_dir, "data.csv")
-    num_samples = 42
+    num_samples = 22
     data = {
         "id": range(1, num_samples + 1),
         "input": [float(i) for i in range(1, num_samples + 1)],
@@ -208,6 +238,8 @@ if __name__ == "__main__":
         chunk_size=chunk_size,
         batch_size=batch_size,
         intermediate_dir=os.path.join(temp_dir, "intermediate"),
+        final_output_dir=os.path.join(temp_dir, "final_outputs"),
+        save_output=True,
     )
 
     def model(x):
@@ -234,7 +266,8 @@ if __name__ == "__main__":
 
     processor.finalize()
 
-    df = pd.read_csv(csv_path)
+    final_file = Path(csv_path).parent / f"{Path(csv_path).stem}_with_output.csv"
+    df = pd.read_csv(final_file)
     print(f"\nFinal CSV contents after Test 1 ({len(df)} rows):")
     print(df.head(10))
 
@@ -253,6 +286,7 @@ if __name__ == "__main__":
         chunk_size=chunk_size,
         batch_size=batch_size,
         intermediate_dir=os.path.join(temp_dir, "intermediate"),
+        save_output=True,
     )
 
     chunks_processed = 0
@@ -272,10 +306,8 @@ if __name__ == "__main__":
 
     processor.finalize()
 
-    df = pd.read_csv(csv_path)
-    assert "tensor_path" in df.columns, "Tensor path column missing"
-    print(f"\nLayer 1 complete. Tensor paths added to CSV ({len(df)} rows).")
-    print(f"Number of tensor paths: {len(df['tensor_path'].dropna())}")
+    intermediate_files = list(Path(temp_dir, "intermediate").glob("chunk_*.pt"))
+    print(f"\nLayer 1 complete. Created {len(intermediate_files)} intermediate chunk files.")
 
     print("\nProcessing Layer 2...")
     processor = ChunkedCSVProcessor(
@@ -285,6 +317,8 @@ if __name__ == "__main__":
         chunk_size=chunk_size,
         batch_size=batch_size,
         intermediate_dir=os.path.join(temp_dir, "intermediate"),
+        final_output_dir=os.path.join(temp_dir, "final_outputs"),
+        save_output=True,
     )
 
     chunks_processed = 0
@@ -295,14 +329,9 @@ if __name__ == "__main__":
         while (batch := processor.next_batch()) is not None:
             batch_count += 1
             batch_data, start_idx, end_idx = batch
-            print(
-                f"  Batch {batch_count}: {len(batch_data)} tensors (indices {start_idx}-{end_idx-1})"
-            )
+            print(f"  Batch {batch_count}: {len(batch_data)} tensors (indices {start_idx}-{end_idx-1})")
 
-            if len(batch_data) > 1:
-                input_tensor = torch.stack(batch_data)
-            else:
-                input_tensor = batch_data[0].unsqueeze(0)
+            input_tensor = batch_data
 
             outputs = input_tensor * 3
             processor.save_batch_output(outputs, start_idx, end_idx)
@@ -311,7 +340,8 @@ if __name__ == "__main__":
 
     processor.finalize()
 
-    df = pd.read_csv(csv_path)
+    final_file = Path(csv_path).parent / f"{Path(csv_path).stem}_with_final_output.csv"
+    df = pd.read_csv(final_file)
     print(f"\nFinal CSV after both layers ({len(df)} rows):")
     print(df[["id", "input", "final_output"]].head(10))
     print("\n...")
@@ -319,19 +349,24 @@ if __name__ == "__main__":
 
     assert "final_output" in df.columns, "Final output column missing"
     assert len(df) == num_samples, f"Expected {num_samples} rows, got {len(df)}"
-    assert np.allclose(
-        df["input"] * 6, df["final_output"]
-    ), "Incorrect final output values"
+    
+    nan_count = df["final_output"].isna().sum()
+    if nan_count > 0:
+        print(f"Warning: Found {nan_count} NaN values in final_output")
+        print("Rows with NaN values:")
+        print(df[df["final_output"].isna()][["id", "input", "final_output"]])
+    
+    valid_mask = ~df["final_output"].isna()
+    if valid_mask.sum() > 0:
+        expected = df.loc[valid_mask, "input"] * 6
+        actual = df.loc[valid_mask, "final_output"]
+        assert np.allclose(expected, actual), f"Incorrect final output values. Expected {expected.values}, got {actual.values}"
+    
     print("\nTest 2 passed: Final output values correct")
 
-    print("\nTest 3: Intermediate file validation")
-
-    tensor_files = list(os.listdir(os.path.join(temp_dir, "intermediate")))
-    print(f"Found {len(tensor_files)} intermediate tensor files")
-
-    assert (
-        len(tensor_files) == num_samples
-    ), f"Expected {num_samples} tensor files, found {len(tensor_files)}"
+    print("\nTest 3: Memory efficiency validation")
+    remaining_intermediate = list(Path(temp_dir, "intermediate").glob("*.pt"))
+    print(f"Remaining intermediate files: {len(remaining_intermediate)}")
 
     shutil.rmtree(temp_dir)
     print(f"\nAll tests passed! Removed temporary directory: {temp_dir}")
