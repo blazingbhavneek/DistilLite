@@ -155,7 +155,7 @@ class ThreadSafeChunkProcessor:
         self, intermediate_tensor: torch.Tensor, batch_index: int
     ) -> Optional[Tuple[torch.Tensor, int, int]]:
         """Load a batch from an already loaded intermediate tensor."""
-        
+
         # Start index for the batch
         start = batch_index * self.config.batch_size
         if start >= len(intermediate_tensor):
@@ -384,46 +384,62 @@ if __name__ == "__main__":
         """Process all chunks using preloaded cache efficiently."""
         chunk_paths = []
         current_chunk_data = None
-        
+
         with ThreadPoolExecutor(max_workers=1) as executor:
             # Preload first chunk
             if processor.num_chunks > 0:
                 print("🔄 Preloading first chunk...")
                 current_chunk_data = processor.load_chunk(0)
-                print(f"✅ First chunk loaded: {get_memory_info(current_chunk_data, 'Chunk 0')}")
-            
+                print(
+                    f"✅ First chunk loaded: {get_memory_info(current_chunk_data, 'Chunk 0')}"
+                )
+
             for chunk_idx in range(processor.num_chunks):
                 print(f"\n[Chunk {chunk_idx}] Starting processing")
                 start_time = time.time()
-                
+
                 # Use cached data (already loaded)
                 chunk_data = current_chunk_data
                 print(f"[Chunk {chunk_idx}] Using cached data: {len(chunk_data)} rows")
-                
+
                 # Start loading next chunk in background while processing current
                 next_chunk_future = None
                 if chunk_idx + 1 < processor.num_chunks:
-                    print(f"[Chunk {chunk_idx}] 🔄 Starting background load of chunk {chunk_idx + 1}")
-                    next_chunk_future = executor.submit(processor.load_chunk, chunk_idx + 1)
-                
+                    print(
+                        f"[Chunk {chunk_idx}] 🔄 Starting background load of chunk {chunk_idx + 1}"
+                    )
+                    next_chunk_future = executor.submit(
+                        processor.load_chunk, chunk_idx + 1
+                    )
+
                 # Process current chunk
                 num_batches = (len(chunk_data) + batch_size - 1) // batch_size
                 chunk_storage = None
-                
+
                 for batch_idx in range(num_batches):
                     batch_result = processor.get_batch(chunk_data, batch_idx)
                     if batch_result is None:
                         break
 
                     batch_data, start_idx, end_idx = batch_result
-                    print(f"[Chunk {chunk_idx}] Processing batch {batch_idx + 1}/{num_batches} (indices {start_idx}-{end_idx-1})")
+                    print(
+                        f"[Chunk {chunk_idx}] Processing batch {batch_idx + 1}/{num_batches} (indices {start_idx}-{end_idx-1})"
+                    )
 
                     # Check if next chunk is ready
-                    if next_chunk_future and next_chunk_future.done() and chunk_idx + 1 < processor.num_chunks:
+                    if (
+                        next_chunk_future
+                        and next_chunk_future.done()
+                        and chunk_idx + 1 < processor.num_chunks
+                    ):
                         current_chunk_data = next_chunk_future.result()
-                        memory_info = get_memory_info(current_chunk_data, f"Chunk {chunk_idx + 1}")
+                        memory_info = get_memory_info(
+                            current_chunk_data, f"Chunk {chunk_idx + 1}"
+                        )
                         print(f"    🎉 BACKGROUND LOAD COMPLETE: {memory_info}")
-                        print(f"    📊 Loaded {len(current_chunk_data)} rows while processing current batch")
+                        print(
+                            f"    📊 Loaded {len(current_chunk_data)} rows while processing current batch"
+                        )
                         next_chunk_future = None  # Mark as consumed
 
                     # Process batch
@@ -432,34 +448,48 @@ if __name__ == "__main__":
 
                     # Initialize storage using first batch
                     if chunk_storage is None:
-                        chunk_storage = processor.create_chunk_storage(len(chunk_data), outputs)
-                        print(f"    📦 Created chunk storage: {get_memory_info(chunk_storage, 'Storage')}")
+                        chunk_storage = processor.create_chunk_storage(
+                            len(chunk_data), outputs
+                        )
+                        print(
+                            f"    📦 Created chunk storage: {get_memory_info(chunk_storage, 'Storage')}"
+                        )
 
                     # Update storage with model outputs
-                    chunk_storage = processor.update_chunk_storage(chunk_storage, outputs, start_idx, end_idx)
+                    chunk_storage = processor.update_chunk_storage(
+                        chunk_storage, outputs, start_idx, end_idx
+                    )
 
                 # Wait for next chunk if still loading
                 if next_chunk_future and not next_chunk_future.done():
-                    print(f"[Chunk {chunk_idx}] ⏳ Waiting for next chunk {chunk_idx + 1} to finish loading...")
+                    print(
+                        f"[Chunk {chunk_idx}] ⏳ Waiting for next chunk {chunk_idx + 1} to finish loading..."
+                    )
                     current_chunk_data = next_chunk_future.result()
-                    memory_info = get_memory_info(current_chunk_data, f"Chunk {chunk_idx + 1}")
+                    memory_info = get_memory_info(
+                        current_chunk_data, f"Chunk {chunk_idx + 1}"
+                    )
                     print(f"    🎉 BACKGROUND LOAD COMPLETE: {memory_info}")
                 elif next_chunk_future and chunk_idx + 1 < processor.num_chunks:
                     # Already loaded, just consume the result
                     if current_chunk_data is None:
                         current_chunk_data = next_chunk_future.result()
-                        memory_info = get_memory_info(current_chunk_data, f"Chunk {chunk_idx + 1}")
+                        memory_info = get_memory_info(
+                            current_chunk_data, f"Chunk {chunk_idx + 1}"
+                        )
                         print(f"    🎉 BACKGROUND LOAD ALREADY COMPLETE: {memory_info}")
 
                 # Save chunk
                 if chunk_storage is not None:
-                    chunk_path = processor.save_chunk_final(chunk_data, chunk_storage, chunk_idx)
+                    chunk_path = processor.save_chunk_final(
+                        chunk_data, chunk_storage, chunk_idx
+                    )
                     chunk_paths.append(chunk_path)
                     print(f"[Chunk {chunk_idx}] Saved to {chunk_path}")
 
                 total_time = time.time() - start_time
                 print(f"[Chunk {chunk_idx}] Complete in {total_time:.2f}s")
-        
+
         return chunk_paths
 
     # Process all chunks with caching
@@ -509,26 +539,34 @@ if __name__ == "__main__":
     def process_layer1_all_chunks():
         """Process all layer 1 chunks efficiently."""
         current_chunk_data = None
-        
+
         with ThreadPoolExecutor(max_workers=1) as executor:
             # Preload first chunk
             if processor_layer1.num_chunks > 0:
                 print("🔄 Preloading first chunk for Layer 1...")
                 current_chunk_data = processor_layer1.load_chunk(0)
-                print(f"✅ First chunk loaded: {get_memory_info(current_chunk_data, 'Layer1-Chunk 0')}")
-            
+                print(
+                    f"✅ First chunk loaded: {get_memory_info(current_chunk_data, 'Layer1-Chunk 0')}"
+                )
+
             for chunk_idx in range(processor_layer1.num_chunks):
                 print(f"\n[Layer1-Chunk {chunk_idx}] Processing...")
-                
+
                 # Use cached data
                 chunk_data = current_chunk_data
-                print(f"[Layer1-Chunk {chunk_idx}] Using cached data: {len(chunk_data)} rows")
-                
+                print(
+                    f"[Layer1-Chunk {chunk_idx}] Using cached data: {len(chunk_data)} rows"
+                )
+
                 # Start loading next chunk in background
                 next_chunk_future = None
                 if chunk_idx + 1 < processor_layer1.num_chunks:
-                    print(f"[Layer1-Chunk {chunk_idx}] 🔄 Starting background load of chunk {chunk_idx + 1}")
-                    next_chunk_future = executor.submit(processor_layer1.load_chunk, chunk_idx + 1)
+                    print(
+                        f"[Layer1-Chunk {chunk_idx}] 🔄 Starting background load of chunk {chunk_idx + 1}"
+                    )
+                    next_chunk_future = executor.submit(
+                        processor_layer1.load_chunk, chunk_idx + 1
+                    )
 
                 num_batches = (len(chunk_data) + batch_size - 1) // batch_size
                 chunk_storage = None
@@ -539,54 +577,84 @@ if __name__ == "__main__":
                         break
 
                     batch_data, start_idx, end_idx = batch_result
-                    print(f"[Layer1-Chunk {chunk_idx}] Batch {batch_idx + 1}/{num_batches} (indices {start_idx}-{end_idx-1})")
+                    print(
+                        f"[Layer1-Chunk {chunk_idx}] Batch {batch_idx + 1}/{num_batches} (indices {start_idx}-{end_idx-1})"
+                    )
 
                     # Check background loading
-                    if next_chunk_future and next_chunk_future.done() and chunk_idx + 1 < processor_layer1.num_chunks:
+                    if (
+                        next_chunk_future
+                        and next_chunk_future.done()
+                        and chunk_idx + 1 < processor_layer1.num_chunks
+                    ):
                         current_chunk_data = next_chunk_future.result()
-                        memory_info = get_memory_info(current_chunk_data, f"Layer1-Chunk {chunk_idx + 1}")
+                        memory_info = get_memory_info(
+                            current_chunk_data, f"Layer1-Chunk {chunk_idx + 1}"
+                        )
                         print(f"    🎉 BACKGROUND LOAD COMPLETE: {memory_info}")
                         next_chunk_future = None
 
                     input_tensor = torch.tensor(batch_data, dtype=torch.float32)
                     processing_time = random.uniform(1.0, 2.0)
-                    print(f"    [Layer1] Processing batch of size {len(input_tensor)} - will take {processing_time:.1f}s")
+                    print(
+                        f"    [Layer1] Processing batch of size {len(input_tensor)} - will take {processing_time:.1f}s"
+                    )
                     time.sleep(processing_time)
                     outputs = input_tensor * 2
                     print(f"    [Layer1] Batch processing complete")
 
                     # Initialize storage using first batch
                     if chunk_storage is None:
-                        chunk_storage = processor_layer1.create_chunk_storage(len(chunk_data), outputs)
-                        print(f"    📦 Created Layer1 storage: {get_memory_info(chunk_storage, 'Layer1Storage')}")
+                        chunk_storage = processor_layer1.create_chunk_storage(
+                            len(chunk_data), outputs
+                        )
+                        print(
+                            f"    📦 Created Layer1 storage: {get_memory_info(chunk_storage, 'Layer1Storage')}"
+                        )
 
                     # Update storage with model outputs
-                    chunk_storage = processor_layer1.update_chunk_storage(chunk_storage, outputs, start_idx, end_idx)
+                    chunk_storage = processor_layer1.update_chunk_storage(
+                        chunk_storage, outputs, start_idx, end_idx
+                    )
 
                 # Wait for next chunk if needed
                 if next_chunk_future and not next_chunk_future.done():
-                    print(f"[Layer1-Chunk {chunk_idx}] ⏳ Waiting for next chunk to finish loading...")
+                    print(
+                        f"[Layer1-Chunk {chunk_idx}] ⏳ Waiting for next chunk to finish loading..."
+                    )
                     current_chunk_data = next_chunk_future.result()
-                    memory_info = get_memory_info(current_chunk_data, f"Layer1-Chunk {chunk_idx + 1}")
+                    memory_info = get_memory_info(
+                        current_chunk_data, f"Layer1-Chunk {chunk_idx + 1}"
+                    )
                     print(f"    🎉 BACKGROUND LOAD COMPLETE: {memory_info}")
                 elif next_chunk_future and chunk_idx + 1 < processor_layer1.num_chunks:
                     if current_chunk_data is None:
                         current_chunk_data = next_chunk_future.result()
-                        memory_info = get_memory_info(current_chunk_data, f"Layer1-Chunk {chunk_idx + 1}")
+                        memory_info = get_memory_info(
+                            current_chunk_data, f"Layer1-Chunk {chunk_idx + 1}"
+                        )
                         print(f"    🎉 BACKGROUND LOAD ALREADY COMPLETE: {memory_info}")
 
                 # Save intermediate tensors to disk
                 if chunk_storage is not None:
-                    intermediate_path = processor_layer1.save_chunk_intermediate(chunk_storage, chunk_idx)
-                    print(f"[Layer1-Chunk {chunk_idx}] 💾 Saved intermediate tensors to {intermediate_path}")
-                    print(f"    📁 File size: {intermediate_path.stat().st_size / (1024*1024):.2f} MB")
+                    intermediate_path = processor_layer1.save_chunk_intermediate(
+                        chunk_storage, chunk_idx
+                    )
+                    print(
+                        f"[Layer1-Chunk {chunk_idx}] 💾 Saved intermediate tensors to {intermediate_path}"
+                    )
+                    print(
+                        f"    📁 File size: {intermediate_path.stat().st_size / (1024*1024):.2f} MB"
+                    )
 
     # Process all layer 1 chunks
     process_layer1_all_chunks()
 
     # List intermediate files created
     intermediate_files = list(Path(temp_dir, "intermediate").glob("chunk_*.pt"))
-    print(f"\nLayer 1 complete. Created {len(intermediate_files)} intermediate tensor files.")
+    print(
+        f"\nLayer 1 complete. Created {len(intermediate_files)} intermediate tensor files."
+    )
 
     print("\nProcessing second layer (intermediate tensors -> final output)...")
 
@@ -610,20 +678,28 @@ if __name__ == "__main__":
         chunk_paths = []
         current_chunk_data = None
         current_intermediate_tensor = None
-        
-        with ThreadPoolExecutor(max_workers=2) as executor:  # 2 workers: one for CSV, one for tensors
+
+        with ThreadPoolExecutor(
+            max_workers=2
+        ) as executor:  # 2 workers: one for CSV, one for tensors
             # Preload first chunk's data and intermediate tensor
             if processor_layer2.num_chunks > 0:
                 print("🔄 Preloading first chunk data and intermediate tensor...")
                 csv_future = executor.submit(processor_layer2.load_chunk, 0)
                 intermediate_path = Path(temp_dir, "intermediate") / "chunk_0.pt"
-                tensor_future = executor.submit(torch.load, intermediate_path, weights_only=False)
-                
+                tensor_future = executor.submit(
+                    torch.load, intermediate_path, weights_only=False
+                )
+
                 current_chunk_data = csv_future.result()
                 current_intermediate_tensor = tensor_future.result()
-                print(f"✅ First chunk loaded: {get_memory_info(current_chunk_data, 'Chunk 0')}")
-                print(f"✅ First intermediate loaded: {get_memory_info(current_intermediate_tensor, 'Intermediate 0')}")
-            
+                print(
+                    f"✅ First chunk loaded: {get_memory_info(current_chunk_data, 'Chunk 0')}"
+                )
+                print(
+                    f"✅ First intermediate loaded: {get_memory_info(current_intermediate_tensor, 'Intermediate 0')}"
+                )
+
             for chunk_idx in range(processor_layer2.num_chunks):
                 print(f"\n[Layer2-Chunk {chunk_idx}] Processing...")
                 start_time = time.time()
@@ -631,40 +707,68 @@ if __name__ == "__main__":
                 # Use cached data
                 chunk_data = current_chunk_data
                 intermediate_tensor = current_intermediate_tensor
-                print(f"[Layer2-Chunk {chunk_idx}] Using cached CSV data: {len(chunk_data)} rows")
-                print(f"[Layer2-Chunk {chunk_idx}] Using cached intermediate tensor: {get_memory_info(intermediate_tensor, 'CachedTensor')}")
+                print(
+                    f"[Layer2-Chunk {chunk_idx}] Using cached CSV data: {len(chunk_data)} rows"
+                )
+                print(
+                    f"[Layer2-Chunk {chunk_idx}] Using cached intermediate tensor: {get_memory_info(intermediate_tensor, 'CachedTensor')}"
+                )
 
                 # Start loading next chunk's data and intermediate tensor in background
                 next_csv_future = None
                 next_tensor_future = None
                 if chunk_idx + 1 < processor_layer2.num_chunks:
-                    print(f"[Layer2-Chunk {chunk_idx}] 🔄 Starting background load of chunk {chunk_idx + 1}")
-                    next_csv_future = executor.submit(processor_layer2.load_chunk, chunk_idx + 1)
-                    next_intermediate_path = Path(temp_dir, "intermediate") / f"chunk_{chunk_idx + 1}.pt"
+                    print(
+                        f"[Layer2-Chunk {chunk_idx}] 🔄 Starting background load of chunk {chunk_idx + 1}"
+                    )
+                    next_csv_future = executor.submit(
+                        processor_layer2.load_chunk, chunk_idx + 1
+                    )
+                    next_intermediate_path = (
+                        Path(temp_dir, "intermediate") / f"chunk_{chunk_idx + 1}.pt"
+                    )
                     if next_intermediate_path.exists():
-                        next_tensor_future = executor.submit(torch.load, next_intermediate_path, weights_only=False)
+                        next_tensor_future = executor.submit(
+                            torch.load, next_intermediate_path, weights_only=False
+                        )
 
                 num_batches = (len(intermediate_tensor) + batch_size - 1) // batch_size
                 chunk_storage = None
 
                 for batch_idx in range(num_batches):
-                    batch_result = processor_layer2.load_batch_from_intermediate_tensor(intermediate_tensor, batch_idx)
+                    batch_result = processor_layer2.load_batch_from_intermediate_tensor(
+                        intermediate_tensor, batch_idx
+                    )
                     if batch_result is None:
                         break
 
                     batch_data, start_idx, end_idx = batch_result
-                    print(f"[Layer2-Chunk {chunk_idx}] Processing batch {batch_idx + 1}/{num_batches} (indices {start_idx}-{end_idx-1})")
+                    print(
+                        f"[Layer2-Chunk {chunk_idx}] Processing batch {batch_idx + 1}/{num_batches} (indices {start_idx}-{end_idx-1})"
+                    )
 
                     # Check background loading status
-                    if next_csv_future and next_csv_future.done() and chunk_idx + 1 < processor_layer2.num_chunks:
+                    if (
+                        next_csv_future
+                        and next_csv_future.done()
+                        and chunk_idx + 1 < processor_layer2.num_chunks
+                    ):
                         current_chunk_data = next_csv_future.result()
-                        memory_info = get_memory_info(current_chunk_data, f"NextCSV-{chunk_idx + 1}")
+                        memory_info = get_memory_info(
+                            current_chunk_data, f"NextCSV-{chunk_idx + 1}"
+                        )
                         print(f"    🎉 CSV PRELOAD COMPLETE: {memory_info}")
                         next_csv_future = None
 
-                    if next_tensor_future and next_tensor_future.done() and chunk_idx + 1 < processor_layer2.num_chunks:
+                    if (
+                        next_tensor_future
+                        and next_tensor_future.done()
+                        and chunk_idx + 1 < processor_layer2.num_chunks
+                    ):
                         current_intermediate_tensor = next_tensor_future.result()
-                        memory_info = get_memory_info(current_intermediate_tensor, f"NextTensor-{chunk_idx + 1}")
+                        memory_info = get_memory_info(
+                            current_intermediate_tensor, f"NextTensor-{chunk_idx + 1}"
+                        )
                         print(f"    🎉 TENSOR PRELOAD COMPLETE: {memory_info}")
                         next_tensor_future = None
 
@@ -673,26 +777,38 @@ if __name__ == "__main__":
 
                     # Initialize storage using first batch
                     if chunk_storage is None:
-                        chunk_storage = processor_layer2.create_chunk_storage(len(chunk_data), outputs)
-                        print(f"    📦 Created Layer2 storage: {get_memory_info(chunk_storage, 'Layer2Storage')}")
+                        chunk_storage = processor_layer2.create_chunk_storage(
+                            len(chunk_data), outputs
+                        )
+                        print(
+                            f"    📦 Created Layer2 storage: {get_memory_info(chunk_storage, 'Layer2Storage')}"
+                        )
 
                     # Update storage with model outputs
-                    chunk_storage = processor_layer2.update_chunk_storage(chunk_storage, outputs, start_idx, end_idx)
+                    chunk_storage = processor_layer2.update_chunk_storage(
+                        chunk_storage, outputs, start_idx, end_idx
+                    )
 
                 # Wait for any remaining background loads
                 if next_csv_future and not next_csv_future.done():
                     print(f"[Layer2-Chunk {chunk_idx}] ⏳ Waiting for CSV preload...")
                     current_chunk_data = next_csv_future.result()
-                    memory_info = get_memory_info(current_chunk_data, f"NextCSV-{chunk_idx + 1}")
+                    memory_info = get_memory_info(
+                        current_chunk_data, f"NextCSV-{chunk_idx + 1}"
+                    )
                     print(f"    🎉 CSV PRELOAD COMPLETE: {memory_info}")
                 elif next_csv_future and chunk_idx + 1 < processor_layer2.num_chunks:
                     if current_chunk_data is None:
                         current_chunk_data = next_csv_future.result()
 
                 if next_tensor_future and not next_tensor_future.done():
-                    print(f"[Layer2-Chunk {chunk_idx}] ⏳ Waiting for tensor preload...")
+                    print(
+                        f"[Layer2-Chunk {chunk_idx}] ⏳ Waiting for tensor preload..."
+                    )
                     current_intermediate_tensor = next_tensor_future.result()
-                    memory_info = get_memory_info(current_intermediate_tensor, f"NextTensor-{chunk_idx + 1}")
+                    memory_info = get_memory_info(
+                        current_intermediate_tensor, f"NextTensor-{chunk_idx + 1}"
+                    )
                     print(f"    🎉 TENSOR PRELOAD COMPLETE: {memory_info}")
                 elif next_tensor_future and chunk_idx + 1 < processor_layer2.num_chunks:
                     if current_intermediate_tensor is None:
@@ -700,15 +816,19 @@ if __name__ == "__main__":
 
                 # Save final output chunk
                 if chunk_storage is not None:
-                    chunk_path = processor_layer2.save_chunk_final(chunk_data, chunk_storage, chunk_idx)
+                    chunk_path = processor_layer2.save_chunk_final(
+                        chunk_data, chunk_storage, chunk_idx
+                    )
                     chunk_paths.append(chunk_path)
-                    print(f"[Layer2-Chunk {chunk_idx}] 💾 Saved final output to {chunk_path}")
+                    print(
+                        f"[Layer2-Chunk {chunk_idx}] 💾 Saved final output to {chunk_path}"
+                    )
                     file_size = chunk_path.stat().st_size / (1024 * 1024)
                     print(f"    📁 Output file size: {file_size:.2f} MB")
 
                 total_time = time.time() - start_time
                 print(f"[Layer2-Chunk {chunk_idx}] Complete in {total_time:.2f}s")
-        
+
         return chunk_paths
 
     # Process all layer 2 chunks
