@@ -1,11 +1,13 @@
 import os
+import random
 import shutil
 import tempfile
-from pathlib import Path
-from dataclasses import dataclass
-from typing import Optional, Tuple, Union
-import threading
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -15,133 +17,190 @@ import torch
 @dataclass(frozen=True)
 class ProcessingConfig:
     """Immutable configuration for CSV processing."""
-    csv_path: str
-    input_col: Optional[str]
-    output_col: Optional[str]
-    chunk_size: int
-    batch_size: int
-    intermediate_dir: str
-    final_output_dir: str
-    save_output: bool
+
+    csv_path: str  # Path for the input CSV file
+    input_col: Optional[str]  # Column name for input data
+    output_col: Optional[
+        str
+    ]  # Column name for output data, if it doesn't exist, will be created
+    chunk_size: int  # Number of rows per chunk to be loaded from disk
+    batch_size: int  # Number of rows per batch to be processed
+    intermediate_dir: (
+        str  # Directory for storing intermediate tensor/ Output from hidden layers
+    )
+    final_output_dir: str  # Directory for final output after processing
+    save_output: bool  # Whether to save output to disk or not
 
 
 class ThreadSafeChunkProcessor:
     """Thread-safe CSV processor with separated methods for independent execution."""
-    
+
     def __init__(self, config: ProcessingConfig):
         self.config = config
-        
+
         self._csv_metadata = self._compute_csv_metadata()
-        
+
         Path(self.config.intermediate_dir).mkdir(parents=True, exist_ok=True)
         if self.config.save_output and self.config.output_col:
             Path(self.config.final_output_dir).mkdir(parents=True, exist_ok=True)
-    
+
     def _compute_csv_metadata(self) -> dict:
         """Compute CSV metadata once during initialization."""
+
+        # Read header for column names
         df_header = pd.read_csv(self.config.csv_path, nrows=0)
-        
+
+        # Count total rows in the CSV file
         with open(self.config.csv_path, "r") as f:
             total_rows = sum(1 for _ in f) - 1
-        
+
+        # Calculate number of chunks based on chunk size
         num_chunks = (total_rows + self.config.chunk_size - 1) // self.config.chunk_size
-        
-        return {
-            'header': df_header,
-            'total_rows': total_rows,
-            'num_chunks': num_chunks
-        }
-    
+
+        return {"header": df_header, "total_rows": total_rows, "num_chunks": num_chunks}
+
     @property
     def num_chunks(self) -> int:
         """Get total number of chunks."""
-        return self._csv_metadata['num_chunks']
-    
+        return self._csv_metadata["num_chunks"]
+
     @property
     def total_rows(self) -> int:
         """Get total number of rows."""
-        return self._csv_metadata['total_rows']
-    
+        return self._csv_metadata["total_rows"]
+
     def load_chunk(self, chunk_index: int) -> pd.DataFrame:
-        """Load a specific chunk from CSV. Thread-safe."""
+        """Load a specific chunk from CSV."""
+
+        # Validate chunk index
         if chunk_index >= self.num_chunks:
-            raise IndexError(f"Chunk index {chunk_index} out of range (0-{self.num_chunks-1})")
-        
+            raise IndexError(
+                f"Chunk index {chunk_index} out of range (0-{self.num_chunks-1})"
+            )
+
+        # Calculate number of rows to skip to get the correct chunk
         skip_rows = 1 + chunk_index * self.config.chunk_size
+
+        # Calculate number of rows left in the file
         rows_left = self.total_rows - (chunk_index * self.config.chunk_size)
+
+        # Getting read size for the chunk
         read_size = min(self.config.chunk_size, rows_left)
-        
+
         chunk_data = pd.read_csv(
             self.config.csv_path,
             skiprows=skip_rows,
             nrows=read_size,
             header=None,
-            names=self._csv_metadata['header'].columns,
+            names=self._csv_metadata["header"].columns,
         )
-        
+
         return chunk_data
-    
-    def get_batch(self, chunk_data: pd.DataFrame, batch_index: int) -> Optional[Tuple[Union[np.ndarray, torch.Tensor], int, int]]:
-        """Extract a batch from chunk data. Thread-safe."""
+
+    def get_batch(
+        self, chunk_data: pd.DataFrame, batch_index: int
+    ) -> Optional[Tuple[Union[np.ndarray, torch.Tensor], int, int]]:
+        """Extract a batch from chunk data."""
+
+        # Start index for the batch
         start = batch_index * self.config.batch_size
         if start >= len(chunk_data):
             return None
-        
+
+        # End index for the batch
         end = min(start + self.config.batch_size, len(chunk_data))
-        
+
+        # If going through hidden layers, then input_col is None and we need to load from intermediate tensors
         if self.config.input_col is None:
-            raise ValueError("Cannot extract batch from chunk_data when input_col is None. Use load_batch_from_intermediate instead.")
-        
+            raise ValueError(
+                "Cannot extract batch from chunk_data when input_col is None. Use load_batch_from_intermediate instead."
+            )
+
         batch_data = chunk_data.iloc[start:end][self.config.input_col].values
         return batch_data, start, end
-    
-    def load_batch_from_intermediate(self, chunk_index: int, batch_index: int) -> Optional[Tuple[torch.Tensor, int, int]]:
-        """Load a batch from intermediate tensor files. Thread-safe."""
+
+    def load_batch_from_intermediate(
+        self, chunk_index: int, batch_index: int
+    ) -> Optional[Tuple[torch.Tensor, int, int]]:
+        """Load a batch from intermediate tensor files."""
+
+        # Chunk file path
         chunk_file = Path(self.config.intermediate_dir) / f"chunk_{chunk_index}.pt"
         if not chunk_file.exists():
-            raise FileNotFoundError(f"No intermediate data found for chunk {chunk_index}")
-        
+            raise FileNotFoundError(
+                f"No intermediate data found for chunk {chunk_index}"
+            )
+
+        # Load the chunk tensor, weights_only=False to load only the tensor, no metadata
         chunk_tensors = torch.load(chunk_file, weights_only=False)
-        
+
+        # Start index for the batch
         start = batch_index * self.config.batch_size
         if start >= len(chunk_tensors):
             return None
-        
+
+        # End index for the batch
         end = min(start + self.config.batch_size, len(chunk_tensors))
+
+        # Slice the chunk tensor to get the batch
         batch_data = chunk_tensors[start:end]
-        
+
+        # If saved as numpy array, convert to torch tensor
         if not isinstance(batch_data, torch.Tensor):
             batch_data = torch.tensor(batch_data)
-        
+
         return batch_data, start, end
-    
-    def create_chunk_storage(self, chunk_size: int, sample_output: torch.Tensor) -> torch.Tensor:
-        """Create storage tensor for a chunk. Thread-safe."""
+
+    def create_chunk_storage(
+        self, chunk_size: int, sample_output: torch.Tensor
+    ) -> torch.Tensor:
+        """Create storage tensor for a chunk. A chunk store is an empty tensor which will be filled batch-by-batch."""
         if isinstance(sample_output, torch.Tensor):
-            return torch.zeros(chunk_size, *sample_output.shape[1:], dtype=sample_output.dtype)
+            return torch.zeros(
+                chunk_size, *sample_output.shape[1:], dtype=sample_output.dtype
+            )
         else:
             return torch.zeros(chunk_size, dtype=torch.float32)
-    
-    def update_chunk_storage(self, chunk_storage: torch.Tensor, outputs: torch.Tensor, start_idx: int, end_idx: int) -> torch.Tensor:
-        """Update chunk storage with batch outputs. Thread-safe."""
+
+    def update_chunk_storage(
+        self,
+        chunk_storage: torch.Tensor,
+        outputs: torch.Tensor,
+        start_idx: int,
+        end_idx: int,
+    ) -> torch.Tensor:
+        """Update chunk storage with batch outputs."""
         if isinstance(outputs, torch.Tensor):
             outputs = outputs.detach().cpu()
+
+            # If output is padded for batch processing, extract only the relevant rows from it
             if outputs.dim() > 1 and outputs.shape[0] != (end_idx - start_idx):
-                outputs = outputs[:end_idx - start_idx]
+                outputs = outputs[: end_idx - start_idx]
             chunk_storage[start_idx:end_idx] = outputs
         else:
             outputs_tensor = torch.tensor(outputs, dtype=chunk_storage.dtype)
-            if outputs_tensor.dim() > 1 and outputs_tensor.shape[0] != (end_idx - start_idx):
-                outputs_tensor = outputs_tensor[:end_idx - start_idx]
+
+            # If output is padded for batch processing, extract only the relevant rows from it
+            if outputs_tensor.dim() > 1 and outputs_tensor.shape[0] != (
+                end_idx - start_idx
+            ):
+                outputs_tensor = outputs_tensor[: end_idx - start_idx]
             chunk_storage[start_idx:end_idx] = outputs_tensor
-        
+
         return chunk_storage
-    
-    def save_chunk_intermediate(self, chunk_storage: torch.Tensor, chunk_index: int) -> Path:
+
+    def save_chunk_intermediate(
+        self, chunk_storage: torch.Tensor, chunk_index: int
+    ) -> Path:
         """Save chunk storage as intermediate tensor file. Thread-safe with atomic writes."""
         final_path = Path(self.config.intermediate_dir) / f"chunk_{chunk_index}.pt"
-        temp_path = Path(self.config.intermediate_dir) / f"temp_{uuid.uuid4().hex}_chunk_{chunk_index}.pt"
-        
+
+        # Create a temporary file to ensure atomic writes, in case of failure, an exeption is raised that will be caught by the caller
+        temp_path = (
+            Path(self.config.intermediate_dir)
+            / f"temp_{uuid.uuid4().hex}_chunk_{chunk_index}.pt"
+        )
+
         try:
             torch.save(chunk_storage, temp_path)
             temp_path.rename(final_path)
@@ -150,23 +209,33 @@ class ThreadSafeChunkProcessor:
             if temp_path.exists():
                 temp_path.unlink()
             raise
-    
-    def save_chunk_final(self, chunk_data: pd.DataFrame, chunk_storage: torch.Tensor, chunk_index: int) -> Path:
+
+    def save_chunk_final(
+        self, chunk_data: pd.DataFrame, chunk_storage: torch.Tensor, chunk_index: int
+    ) -> Path:
         """Save chunk with outputs to final CSV. Thread-safe with atomic writes."""
+
+        # For saving the outputs of final layers
         if not self.config.output_col:
             raise ValueError("output_col must be specified for final save")
-        
+
         if isinstance(chunk_storage, torch.Tensor):
             output_values = chunk_storage.numpy()
         else:
             output_values = chunk_storage
-        
+
+        # Create a DataFrame for the chunk, with the output column defined in config
         chunk_df = chunk_data.copy()
         chunk_df[self.config.output_col] = output_values
-        
+
         final_path = Path(self.config.final_output_dir) / f"chunk_{chunk_index}.csv"
-        temp_path = Path(self.config.final_output_dir) / f"temp_{uuid.uuid4().hex}_chunk_{chunk_index}.csv"
-        
+
+        # Create a temporary file to ensure atomic writes, in case of failure, an exeption is raised that will be caught by the caller
+        temp_path = (
+            Path(self.config.final_output_dir)
+            / f"temp_{uuid.uuid4().hex}_chunk_{chunk_index}.csv"
+        )
+
         try:
             chunk_df.to_csv(temp_path, index=False)
             temp_path.rename(final_path)
@@ -175,42 +244,55 @@ class ThreadSafeChunkProcessor:
             if temp_path.exists():
                 temp_path.unlink()
             raise
-    
+
     def concatenate_final_outputs(self, chunk_paths: list) -> Path:
-        """Concatenate all chunk CSV files into final output. Thread-safe."""
+        """Concatenate all chunk CSV files into final output."""
         if not chunk_paths:
             raise ValueError("No chunk paths provided")
-        
-        final_output_path = Path(self.config.csv_path).parent / f"{Path(self.config.csv_path).stem}_with_{self.config.output_col}.csv"
-        temp_final_path = Path(self.config.csv_path).parent / f"temp_{uuid.uuid4().hex}_final.csv"
-        
+
+        final_output_path = (
+            Path(self.config.csv_path).parent
+            / f"{Path(self.config.csv_path).stem}_with_{self.config.output_col}.csv"
+        )
+
+        # Create a temporary file to ensure atomic writes, in case of failure, an exeption is raised that will be caught by the caller
+        temp_final_path = (
+            Path(self.config.csv_path).parent / f"temp_{uuid.uuid4().hex}_final.csv"
+        )
+
         try:
-            sorted_paths = sorted(chunk_paths, key=lambda p: int(p.stem.split('_')[1]))
-            
+            # Sort chunk paths to ensure consistent order on basis of their names
+            sorted_paths = sorted(chunk_paths, key=lambda p: int(p.stem.split("_")[1]))
+
+            # Read the first chunk and write it to the temporary final file
             first_chunk = pd.read_csv(sorted_paths[0])
             first_chunk.to_csv(temp_final_path, index=False)
-            
+
+            # For subsequent chunks, append to the temporary final file
             for chunk_path in sorted_paths[1:]:
                 chunk_df = pd.read_csv(chunk_path)
-                chunk_df.to_csv(temp_final_path, mode='a', header=False, index=False)
-            
+                chunk_df.to_csv(temp_final_path, mode="a", header=False, index=False)
+
             temp_final_path.rename(final_output_path)
-            
+
+            # Clean up intermediate chunk files
             for chunk_path in sorted_paths:
                 chunk_path.unlink()
-            
-            if Path(self.config.final_output_dir).exists() and not any(Path(self.config.final_output_dir).iterdir()):
+
+            if Path(self.config.final_output_dir).exists() and not any(
+                Path(self.config.final_output_dir).iterdir()
+            ):
                 Path(self.config.final_output_dir).rmdir()
-            
+
             return final_output_path
-            
+
         except Exception:
             if temp_final_path.exists():
                 temp_final_path.unlink()
             raise
-    
+
     def clear_intermediate(self, chunk_index: Optional[int] = None) -> None:
-        """Clear intermediate tensor files. Thread-safe."""
+        """Clear intermediate tensor files of a particular index."""
         if chunk_index is not None:
             chunk_file = Path(self.config.intermediate_dir) / f"chunk_{chunk_index}.pt"
             if chunk_file.exists():
@@ -220,113 +302,9 @@ class ThreadSafeChunkProcessor:
                 file.unlink()
 
 
-class ChunkedCSVProcessor:
-    """Backward-compatible wrapper around ThreadSafeChunkProcessor."""
-    
-    def __init__(self, csv_path, input_col=None, output_col=None, chunk_size=10000, 
-                 batch_size=256, intermediate_dir="intermediate_tensors", 
-                 final_output_dir="final_outputs", save_output=True):
-        
-        config = ProcessingConfig(
-            csv_path=csv_path,
-            input_col=input_col,
-            output_col=output_col,
-            chunk_size=chunk_size,
-            batch_size=batch_size,
-            intermediate_dir=intermediate_dir,
-            final_output_dir=final_output_dir,
-            save_output=save_output
-        )
-        
-        self.processor = ThreadSafeChunkProcessor(config)
-        
-        self.current_chunk = 0
-        self.current_batch = 0
-        self.chunk_data = None
-        self.chunk_storage = None
-        self.final_output_paths = []
-    
-    @property
-    def total_rows(self):
-        return self.processor.total_rows
-    
-    @property
-    def num_chunks(self):
-        return self.processor.num_chunks
-    
-    def next_chunk(self):
-        """Load next chunk (maintains original interface)."""
-        if self.current_chunk >= self.num_chunks:
-            return False
-        
-        self.chunk_data = self.processor.load_chunk(self.current_chunk)
-        self.current_batch = 0
-        self.chunk_storage = None
-        return True
-    
-    def next_batch(self):
-        """Get next batch (maintains original interface)."""
-        if self.chunk_data is None:
-            return None
-        
-        try:
-            if self.processor.config.input_col is None:
-                result = self.processor.load_batch_from_intermediate(self.current_chunk, self.current_batch)
-            else:
-                result = self.processor.get_batch(self.chunk_data, self.current_batch)
-            
-            if result is not None:
-                self.current_batch += 1
-            
-            return result
-            
-        except (FileNotFoundError, ValueError):
-            return None
-    
-    def save_batch_output(self, outputs, start_idx, end_idx):
-        """Save batch output (maintains original interface)."""
-        if not self.processor.config.save_output:
-            return
-        
-        if self.chunk_storage is None:
-            chunk_size = len(self.chunk_data)
-            if isinstance(outputs, torch.Tensor):
-                sample_output = outputs
-            else:
-                sample_output = torch.tensor(outputs)
-            self.chunk_storage = self.processor.create_chunk_storage(chunk_size, sample_output)
-        
-        self.chunk_storage = self.processor.update_chunk_storage(
-            self.chunk_storage, outputs, start_idx, end_idx
-        )
-    
-    def save_chunk_to_disk(self):
-        """Save chunk to disk (maintains original interface)."""
-        if not self.processor.config.save_output or self.chunk_storage is None:
-            self.current_chunk += 1
-            return
-        
-        if self.processor.config.output_col is None:
-            self.processor.save_chunk_intermediate(self.chunk_storage, self.current_chunk)
-        else:
-            chunk_path = self.processor.save_chunk_final(
-                self.chunk_data, self.chunk_storage, self.current_chunk
-            )
-            self.final_output_paths.append(chunk_path)
-        
-        self.current_chunk += 1
-    
-    def finalize(self):
-        """Finalize processing (maintains original interface)."""
-        if self.processor.config.save_output and self.processor.config.output_col and self.final_output_paths:
-            self.processor.concatenate_final_outputs(self.final_output_paths)
-    
-    def clear_intermediate(self, chunk_idx=None):
-        """Clear intermediate files (maintains original interface)."""
-        self.processor.clear_intermediate(chunk_idx)
-
-
 if __name__ == "__main__":
+
+    # Create a temporary directory and sample CSV file
     temp_dir = tempfile.mkdtemp()
     print(f"Created temporary directory: {temp_dir}")
     csv_path = os.path.join(temp_dir, "data.csv")
@@ -338,14 +316,41 @@ if __name__ == "__main__":
     pd.DataFrame(data).to_csv(csv_path, index=False)
     print(f"Created sample CSV with {num_samples} rows at {csv_path}")
 
+    # Defining chunk and batch sizes
     chunk_size = 10
     batch_size = 3
 
-    print("\nTest 1: Simple end-to-end processing")
-    processor = ChunkedCSVProcessor(
+    # Model that takes 2-3 seconds per batch
+    def slow_model(x, layer_name="Model"):
+        """Simulate a slow model with random processing time."""
+        processing_time = random.uniform(2.0, 3.0)
+        print(
+            f"    [{layer_name}] Processing batch of size {len(x)} - will take {processing_time:.1f}s"
+        )
+        time.sleep(processing_time)
+        result = x * 2
+        print(f"    [{layer_name}] Batch processing complete")
+        return result
+
+    # Function to get memory location and size info for an object
+    def get_memory_info(obj, name):
+        """Get memory location and size info for an object."""
+        memory_addr = hex(id(obj))
+        if hasattr(obj, "nbytes"):
+            size_mb = obj.nbytes / 1024
+            return f"{name} @ {memory_addr} ({size_mb:.2f} KB)"
+        else:
+            return f"{name} @ {memory_addr}"
+
+    print("\n" + "=" * 80)
+    print("Test 1: Threaded processing with concurrent chunk loading")
+    print("=" * 80)
+
+    # Immutable configuration for processor
+    config = ProcessingConfig(
         csv_path=csv_path,
         input_col="input",
-        output_col="output",
+        output_col="output",  # Column to save output
         chunk_size=chunk_size,
         batch_size=batch_size,
         intermediate_dir=os.path.join(temp_dir, "intermediate"),
@@ -353,30 +358,170 @@ if __name__ == "__main__":
         save_output=True,
     )
 
-    def model(x):
-        return x * 2
+    # Initialize the thread-safe chunk processor
+    processor = ThreadSafeChunkProcessor(config)
 
-    chunks_processed = 0
-    while processor.next_chunk():
-        chunks_processed += 1
-        print(f"\nProcessing chunk {chunks_processed}")
+    # Process each chunk while loading the next chunk in the another thread
+    def process_chunk_threaded(chunk_index):
+        """Process a single chunk with concurrent loading of next chunk."""
+        print(f"\n[Chunk {chunk_index}] Starting processing")
+        start_time = time.time()
 
-        batch_count = 0
-        while (batch := processor.next_batch()) is not None:
-            batch_count += 1
-            batch_data, start_idx, end_idx = batch
-            print(f"  Batch {batch_count}: indices {start_idx}-{end_idx-1}")
+        # Loading first chunk
+        print(f"[Chunk {chunk_index}] Loading chunk data...")
+        chunk_data = processor.load_chunk(chunk_index)
+        chunk_load_time = time.time() - start_time
+        print(
+            f"[Chunk {chunk_index}] Chunk loaded in {chunk_load_time:.2f}s ({len(chunk_data)} rows)"
+        )
 
-            input_tensor = torch.tensor(batch_data, dtype=torch.float32)
-            outputs = model(input_tensor)
+        # Calculate number of batches
+        num_batches = (len(chunk_data) + batch_size - 1) // batch_size
+        chunk_storage = None
 
-            processor.save_batch_output(outputs, start_idx, end_idx)
+        # Initialize storage for chunk
+        next_chunk_future = None
+        next_chunk_data = None
 
-        processor.save_chunk_to_disk()
-        print(f"Saved chunk {chunks_processed} to disk")
+        # If not the last chunk, preload next chunk in background
+        if chunk_index + 1 < processor.num_chunks:
 
-    processor.finalize()
+            # Create an executor for background loading
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                print(
+                    f"[Chunk {chunk_index}] 🔄 Starting background load of chunk {chunk_index + 1}"
+                )
+                next_chunk_future = executor.submit(
+                    processor.load_chunk, chunk_index + 1
+                )
 
+                # Process current chunk's batches while next chunk loads
+                for batch_idx in range(num_batches):
+                    batch_start_time = time.time()
+
+                    batch_result = processor.get_batch(chunk_data, batch_idx)
+                    if batch_result is None:
+                        break
+
+                    batch_data, start_idx, end_idx = batch_result
+                    print(
+                        f"[Chunk {chunk_index}] Processing batch {batch_idx + 1}/{num_batches} (indices {start_idx}-{end_idx-1})"
+                    )
+
+                    # While  processing each batch, it checks if the new chunk is loaded, then adds it to memory, although not required here
+                    if (
+                        next_chunk_future
+                        and next_chunk_future.done()
+                        and next_chunk_data is None
+                    ):
+                        next_chunk_data = next_chunk_future.result()
+                        memory_info = get_memory_info(
+                            next_chunk_data, f"Chunk {chunk_index + 1}"
+                        )
+                        print(f"    🎉 BACKGROUND LOAD COMPLETE: {memory_info}")
+                        print(
+                            f"    📊 Loaded {len(next_chunk_data)} rows while processing current batch"
+                        )
+
+                    # Infer model outputs
+                    input_tensor = torch.tensor(batch_data, dtype=torch.float32)
+                    outputs = slow_model(input_tensor, "Model")
+
+                    # Initialize storage using first batch
+                    if chunk_storage is None:
+                        chunk_storage = processor.create_chunk_storage(
+                            len(chunk_data), outputs
+                        )
+                        print(
+                            f"    📦 Created chunk storage: {get_memory_info(chunk_storage, 'Storage')}"
+                        )
+
+                    # Update storage with model outputs
+                    chunk_storage = processor.update_chunk_storage(
+                        chunk_storage, outputs, start_idx, end_idx
+                    )
+
+                    batch_time = time.time() - batch_start_time
+                    print(
+                        f"[Chunk {chunk_index}] Batch {batch_idx + 1} complete in {batch_time:.2f}s"
+                    )
+
+                # Final check if next chunk finished loading
+                if next_chunk_future and not next_chunk_future.done():
+                    print(
+                        f"[Chunk {chunk_index}] ⏳ Waiting for next chunk {chunk_index + 1} to finish loading..."
+                    )
+                    next_chunk_data = next_chunk_future.result()
+                    memory_info = get_memory_info(
+                        next_chunk_data, f"Chunk {chunk_index + 1}"
+                    )
+                    print(f"    🎉 BACKGROUND LOAD COMPLETE: {memory_info}")
+                elif next_chunk_data is None and next_chunk_future:
+                    next_chunk_data = next_chunk_future.result()
+                    memory_info = get_memory_info(
+                        next_chunk_data, f"Chunk {chunk_index + 1}"
+                    )
+                    print(f"    🎉 BACKGROUND LOAD ALREADY COMPLETE: {memory_info}")
+        else:
+            # When on last chunk, process without preloading
+            for batch_idx in range(num_batches):
+                batch_result = processor.get_batch(chunk_data, batch_idx)
+                if batch_result is None:
+                    break
+
+                batch_data, start_idx, end_idx = batch_result
+                print(
+                    f"[Chunk {chunk_index}] Processing batch {batch_idx + 1}/{num_batches} (indices {start_idx}-{end_idx-1})"
+                )
+
+                input_tensor = torch.tensor(batch_data, dtype=torch.float32)
+                outputs = slow_model(input_tensor, "Model")
+
+                if chunk_storage is None:
+                    chunk_storage = processor.create_chunk_storage(
+                        len(chunk_data), outputs
+                    )
+                    print(
+                        f"    📦 Created chunk storage: {get_memory_info(chunk_storage, 'Storage')}"
+                    )
+
+                chunk_storage = processor.update_chunk_storage(
+                    chunk_storage, outputs, start_idx, end_idx
+                )
+
+        # Load chunk_storage to disk
+        if chunk_storage is not None:
+            chunk_path = processor.save_chunk_final(
+                chunk_data, chunk_storage, chunk_index
+            )
+            print(f"[Chunk {chunk_index}] Saved to {chunk_path}")
+
+        total_time = time.time() - start_time
+        print(f"[Chunk {chunk_index}] Complete in {total_time:.2f}s")
+        return chunk_path if chunk_storage is not None else None
+
+    # Start processing chunks
+    start_time = time.time()
+    chunk_paths = []
+
+    # Go through each chunk
+    for chunk_idx in range(processor.num_chunks):
+
+        # Process each chunk and return the path of the saved chunk
+        chunk_path = process_chunk_threaded(chunk_idx)
+        if chunk_path:
+            # Store the path of the processed chunk
+            chunk_paths.append(chunk_path)
+
+    # Concatenate all chunk outputs into final output
+    if chunk_paths:
+        final_path = processor.concatenate_final_outputs(chunk_paths)
+        print(f"\nFinal output saved to: {final_path}")
+
+    total_time = time.time() - start_time
+    print(f"\nTest 1 complete in {total_time:.2f}s")
+
+    # Verify results
     final_file = Path(csv_path).parent / f"{Path(csv_path).stem}_with_output.csv"
     df = pd.read_csv(final_file)
     print(f"\nFinal CSV contents after Test 1 ({len(df)} rows):")
@@ -385,45 +530,104 @@ if __name__ == "__main__":
     assert "output" in df.columns, "Output column missing"
     assert len(df) == num_samples, f"Expected {num_samples} rows, got {len(df)}"
     assert np.allclose(df["input"] * 2, df["output"]), "Incorrect output values"
-    print("Test 1 passed: Output values correct")
+    print("✅ Test 1 passed: Output values correct")
 
-    print("\nTest 2: Multi-layer processing")
+    print("\n" + "=" * 80)
+    print("Test 2: Multi-layer processing with intermediate tensors")
+    print("=" * 80)
 
-    print("Processing Layer 1...")
-    processor = ChunkedCSVProcessor(
+    print("\nProcessing Layer 1 (input -> intermediate tensors)...")
+
+    # Configuration for layer 1 processing
+    config_layer1 = ProcessingConfig(
         csv_path=csv_path,
         input_col="input",
-        output_col=None,
+        output_col=None,  # Save as intermediate tensors
         chunk_size=chunk_size,
         batch_size=batch_size,
         intermediate_dir=os.path.join(temp_dir, "intermediate"),
+        final_output_dir=os.path.join(temp_dir, "final_outputs"),
         save_output=True,
     )
 
-    chunks_processed = 0
-    while processor.next_chunk():
-        chunks_processed += 1
-        print(f"\nProcessing chunk {chunks_processed}")
-        batch_count = 0
-        while (batch := processor.next_batch()) is not None:
-            batch_count += 1
-            batch_data, start_idx, end_idx = batch
-            print(f"  Batch {batch_count}: indices {start_idx}-{end_idx-1}")
+    processor_layer1 = ThreadSafeChunkProcessor(config_layer1)
+
+    # Function to process data on first layer
+    def process_layer1_chunk(chunk_index):
+        """Process layer 1: CSV input -> intermediate tensors."""
+        print(f"\n[Layer1-Chunk {chunk_index}] Processing...")
+
+        chunk_data = processor_layer1.load_chunk(chunk_index)
+        print(
+            f"[Layer1-Chunk {chunk_index}] Loaded: {get_memory_info(chunk_data, 'ChunkData')}"
+        )
+
+        num_batches = (len(chunk_data) + batch_size - 1) // batch_size
+        chunk_storage = None
+
+        for batch_idx in range(num_batches):
+            batch_result = processor_layer1.get_batch(chunk_data, batch_idx)
+            if batch_result is None:
+                break
+
+            batch_data, start_idx, end_idx = batch_result
+            print(
+                f"[Layer1-Chunk {chunk_index}] Batch {batch_idx + 1}/{num_batches} (indices {start_idx}-{end_idx-1})"
+            )
+
             input_tensor = torch.tensor(batch_data, dtype=torch.float32)
+            processing_time = random.uniform(1.0, 2.0)
+            print(
+                f"    [Layer1] Processing batch of size {len(input_tensor)} - will take {processing_time:.1f}s"
+            )
+            time.sleep(processing_time)
             outputs = input_tensor * 2
-            processor.save_batch_output(outputs, start_idx, end_idx)
-        processor.save_chunk_to_disk()
-        print(f"Saved chunk {chunks_processed} to disk")
+            print(f"    [Layer1] Batch processing complete")
 
-    processor.finalize()
+            # Initialize storage using first batch
+            if chunk_storage is None:
+                chunk_storage = processor_layer1.create_chunk_storage(
+                    len(chunk_data), outputs
+                )
+                print(
+                    f"    📦 Created Layer1 storage: {get_memory_info(chunk_storage, 'Layer1Storage')}"
+                )
 
+            # Update storage with model outputs
+            chunk_storage = processor_layer1.update_chunk_storage(
+                chunk_storage, outputs, start_idx, end_idx
+            )
+
+        # Save intermediate tensors to disk
+        if chunk_storage is not None:
+            intermediate_path = processor_layer1.save_chunk_intermediate(
+                chunk_storage, chunk_index
+            )
+            print(
+                f"[Layer1-Chunk {chunk_index}] 💾 Saved intermediate tensors to {intermediate_path}"
+            )
+            print(
+                f"    📁 File size: {intermediate_path.stat().st_size / (1024*1024):.2f} MB"
+            )
+
+        return chunk_storage is not None
+
+    # Process all chunks on first layer
+    for chunk_idx in range(processor_layer1.num_chunks):
+        process_layer1_chunk(chunk_idx)
+
+    # List intermediate files created
     intermediate_files = list(Path(temp_dir, "intermediate").glob("chunk_*.pt"))
-    print(f"\nLayer 1 complete. Created {len(intermediate_files)} intermediate chunk files.")
+    print(
+        f"\nLayer 1 complete. Created {len(intermediate_files)} intermediate tensor files."
+    )
 
-    print("\nProcessing Layer 2...")
-    processor = ChunkedCSVProcessor(
+    print("\nProcessing second layer (intermediate tensors -> final output)...")
+
+    # Configuration for second layer
+    config_layer2 = ProcessingConfig(
         csv_path=csv_path,
-        input_col=None,
+        input_col=None,  # Read from intermediate tensors
         output_col="final_output",
         chunk_size=chunk_size,
         batch_size=batch_size,
@@ -432,62 +636,202 @@ if __name__ == "__main__":
         save_output=True,
     )
 
-    chunks_processed = 0
-    while processor.next_chunk():
-        chunks_processed += 1
-        print(f"\nProcessing chunk {chunks_processed}")
-        batch_count = 0
-        while (batch := processor.next_batch()) is not None:
-            batch_count += 1
-            batch_data, start_idx, end_idx = batch
-            print(f"  Batch {batch_count}: {len(batch_data)} tensors (indices {start_idx}-{end_idx-1})")
+    processor_layer2 = ThreadSafeChunkProcessor(config_layer2)
 
-            input_tensor = batch_data
-            outputs = input_tensor * 3
-            processor.save_batch_output(outputs, start_idx, end_idx)
-        processor.save_chunk_to_disk()
-        print(f"Saved chunk {chunks_processed} to disk")
+    # Function to process data on second layer
+    def process_layer2_chunk_threaded(chunk_index):
+        """Process second layer: intermediate tensors -> final output with threading."""
+        print(f"\n[Layer2-Chunk {chunk_index}] Processing...")
+        start_time = time.time()
 
-    processor.finalize()
+        chunk_data = processor_layer2.load_chunk(chunk_index)
+        print(
+            f"[Layer2-Chunk {chunk_index}] Loaded original data: {get_memory_info(chunk_data, 'OriginalData')}"
+        )
 
+        # Load intermediate tensor from disk
+        intermediate_path = Path(temp_dir, "intermediate") / f"chunk_{chunk_index}.pt"
+        intermediate_tensor = torch.load(intermediate_path, weights_only=False)
+        print(
+            f"[Layer2-Chunk {chunk_index}] Loaded intermediate: {get_memory_info(intermediate_tensor, 'IntermediateTensor')}"
+        )
+
+        num_batches = (len(intermediate_tensor) + batch_size - 1) // batch_size
+        chunk_storage = None
+
+        # Preload next chunk's intermediate tensors in background
+        next_intermediate_future = None
+        next_intermediate_tensor = None
+        if chunk_index + 1 < processor_layer2.num_chunks:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                next_intermediate_path = (
+                    Path(temp_dir, "intermediate") / f"chunk_{chunk_index + 1}.pt"
+                )
+                if next_intermediate_path.exists():
+                    print(
+                        f"[Layer2-Chunk {chunk_index}] 🔄 Preloading next intermediate tensor..."
+                    )
+                    next_intermediate_future = executor.submit(
+                        torch.load, next_intermediate_path, weights_only=False
+                    )
+
+                for batch_idx in range(num_batches):
+                    batch_result = processor_layer2.load_batch_from_intermediate(
+                        chunk_index, batch_idx
+                    )
+                    if batch_result is None:
+                        break
+
+                    batch_data, start_idx, end_idx = batch_result
+                    print(
+                        f"[Layer2-Chunk {chunk_index}] Processing batch {batch_idx + 1}/{num_batches} (indices {start_idx}-{end_idx-1})"
+                    )
+
+                    # Check background loading status
+                    if (
+                        next_intermediate_future
+                        and next_intermediate_future.done()
+                        and next_intermediate_tensor is None
+                    ):
+                        next_intermediate_tensor = next_intermediate_future.result()
+                        memory_info = get_memory_info(
+                            next_intermediate_tensor,
+                            f"NextIntermediate-{chunk_index + 1}",
+                        )
+                        print(f"    🎉 INTERMEDIATE PRELOAD COMPLETE: {memory_info}")
+                        next_intermediate_path = (
+                            Path(temp_dir, "intermediate")
+                            / f"chunk_{chunk_index + 1}.pt"
+                        )
+                        file_size = next_intermediate_path.stat().st_size / (
+                            1024 * 1024
+                        )
+                        print(
+                            f"    📁 Loaded {file_size:.2f} MB tensor file while processing batch"
+                        )
+
+                    outputs = slow_model(batch_data, "Layer2")
+                    outputs = outputs * 1.5
+
+                    # Initialize storage using first batch
+                    if chunk_storage is None:
+                        chunk_storage = processor_layer2.create_chunk_storage(
+                            len(chunk_data), outputs
+                        )
+                        print(
+                            f"    📦 Created Layer2 storage: {get_memory_info(chunk_storage, 'Layer2Storage')}"
+                        )
+
+                    # Update storage with model outputs
+                    chunk_storage = processor_layer2.update_chunk_storage(
+                        chunk_storage, outputs, start_idx, end_idx
+                    )
+
+                # Final check on background loading
+                if next_intermediate_future and not next_intermediate_future.done():
+                    print(
+                        f"[Layer2-Chunk {chunk_index}] ⏳ Waiting for intermediate tensor preload..."
+                    )
+                    next_intermediate_tensor = next_intermediate_future.result()
+                    memory_info = get_memory_info(
+                        next_intermediate_tensor, f"NextIntermediate-{chunk_index + 1}"
+                    )
+                    print(f"    🎉 INTERMEDIATE PRELOAD COMPLETE: {memory_info}")
+                elif next_intermediate_tensor is None and next_intermediate_future:
+                    next_intermediate_tensor = next_intermediate_future.result()
+                    memory_info = get_memory_info(
+                        next_intermediate_tensor, f"NextIntermediate-{chunk_index + 1}"
+                    )
+                    print(f"    🎉 INTERMEDIATE ALREADY PRELOADED: {memory_info}")
+        else:
+            # Process last chunk without background loading
+            for batch_idx in range(num_batches):
+                batch_result = processor_layer2.load_batch_from_intermediate(
+                    chunk_index, batch_idx
+                )
+                if batch_result is None:
+                    break
+
+                batch_data, start_idx, end_idx = batch_result
+                print(
+                    f"[Layer2-Chunk {chunk_index}] Processing batch {batch_idx + 1}/{num_batches}"
+                )
+
+                outputs = slow_model(batch_data, "Layer2")
+                outputs = outputs * 1.5
+
+                if chunk_storage is None:
+                    chunk_storage = processor_layer2.create_chunk_storage(
+                        len(chunk_data), outputs
+                    )
+                    print(
+                        f"    📦 Created Layer2 storage: {get_memory_info(chunk_storage, 'Layer2Storage')}"
+                    )
+
+                chunk_storage = processor_layer2.update_chunk_storage(
+                    chunk_storage, outputs, start_idx, end_idx
+                )
+
+        # Save final output chunk
+        chunk_path = None
+        if chunk_storage is not None:
+            chunk_path = processor_layer2.save_chunk_final(
+                chunk_data, chunk_storage, chunk_index
+            )
+            print(f"[Layer2-Chunk {chunk_index}] 💾 Saved final output to {chunk_path}")
+            file_size = chunk_path.stat().st_size / (1024 * 1024)
+            print(f"    📁 Output file size: {file_size:.2f} MB")
+
+        total_time = time.time() - start_time
+        print(f"[Layer2-Chunk {chunk_index}] Complete in {total_time:.2f}s")
+        return chunk_path
+
+    # Process all chunks for second layer
+    layer2_chunk_paths = []
+    for chunk_idx in range(processor_layer2.num_chunks):
+        chunk_path = process_layer2_chunk_threaded(chunk_idx)
+        if chunk_path:
+            layer2_chunk_paths.append(chunk_path)
+
+    # Concatenate final outputs
+    if layer2_chunk_paths:
+        final_path = processor_layer2.concatenate_final_outputs(layer2_chunk_paths)
+        print(f"\nsecond layer final output saved to: {final_path}")
+
+    # Verification of results
     final_file = Path(csv_path).parent / f"{Path(csv_path).stem}_with_final_output.csv"
     df = pd.read_csv(final_file)
     print(f"\nFinal CSV after both layers ({len(df)} rows):")
     print(df[["id", "input", "final_output"]].head(10))
-    print("\n...")
-    print(df[["id", "input", "final_output"]].tail(10))
+    print("...")
+    print(df[["id", "input", "final_output"]].tail(5))
 
+    # Validation checks
     assert "final_output" in df.columns, "Final output column missing"
     assert len(df) == num_samples, f"Expected {num_samples} rows, got {len(df)}"
-    
+
+    # Check for NaN values
     nan_count = df["final_output"].isna().sum()
     if nan_count > 0:
-        print(f"Warning: Found {nan_count} NaN values in final_output")
-        print("Rows with NaN values:")
-        print(df[df["final_output"].isna()][["id", "input", "final_output"]])
-    
+        print(f"⚠️  Warning: Found {nan_count} NaN values in final_output")
+
+    # Verify computation logic
     valid_mask = ~df["final_output"].isna()
     if valid_mask.sum() > 0:
         expected = df.loc[valid_mask, "input"] * 6
         actual = df.loc[valid_mask, "final_output"]
-        assert np.allclose(expected, actual), f"Incorrect final output values. Expected {expected.values}, got {actual.values}"
-    
-    print("\nTest 2 passed: Final output values correct")
+        assert np.allclose(expected, actual), f"Incorrect final output values"
 
-    print("\nTest 3: Memory efficiency validation")
+    print("✅ Test 2 passed: Final output values correct")
+
+    print("\n" + "=" * 80)
+    print("Test 3: Memory efficiency validation")
+    print("=" * 80)
+
+    # Check remaining intermediate files
     remaining_intermediate = list(Path(temp_dir, "intermediate").glob("*.pt"))
     print(f"Remaining intermediate files: {len(remaining_intermediate)}")
 
+    # Cleanup temporary directory
     shutil.rmtree(temp_dir)
-    print(f"\nAll tests passed! Removed temporary directory: {temp_dir}")
-
-    print("\nThread-safe methods available:")
-    print("- processor.processor.load_chunk(chunk_index)")
-    print("- processor.processor.get_batch(chunk_data, batch_index)")
-    print("- processor.processor.load_batch_from_intermediate(chunk_index, batch_index)")
-    print("- processor.processor.create_chunk_storage(chunk_size, sample_output)")
-    print("- processor.processor.update_chunk_storage(storage, outputs, start, end)")
-    print("- processor.processor.save_chunk_intermediate(storage, chunk_index)")
-    print("- processor.processor.save_chunk_final(chunk_data, storage, chunk_index)")
-    print("- processor.processor.concatenate_final_outputs(chunk_paths)")
-    print("- processor.processor.clear_intermediate(chunk_index)")
+    print(f"\n✅ All tests passed! Removed temporary directory: {temp_dir}")
