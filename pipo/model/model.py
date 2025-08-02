@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 
+import torch
 from huggingface_hub import snapshot_download
 from transformers import AutoConfig
 
@@ -16,35 +17,50 @@ class ModelConfig:
     """Immutable Configuration class for thread-safe layer-by-layer Model execution"""
 
     def __init__(self, local_dir: str, repo_id: str):
+
+        # Location of the model files
         self.local_dir: str = local_dir
         self.repo_id: str = repo_id
 
         self.model_path: Path = Path(os.path.join(local_dir, repo_id))
         if not os.path.exists(self.model_path):
             snapshot_download(repo_id=repo_id, local_dir=local_dir)
-
+        
+        # Pretrained Configuration for model Architecture
         self.config = AutoConfig.from_pretrained(self.model_path)
 
+        # Number of layers present in the Model
         self.num_layers: int = self._get_num_layers()
 
+        # Mapping of Architecture specific layer Names to General Names for Inference
         self.layer_names_dict: dict = self._create_layer_names_dict()
 
+        # List of Layers present in Model
         self.layer_names: list[str] = self._create_ordered_layer_names()
 
+        # TODO
         self.layer_to_param_names: dict[str, list[str]] = (
             self._create_layer_param_mapping()
         )
 
-    def _get_num_layers(self) -> int:
-        """Get number of transformer layers from config"""
-        return getattr(
-            self.config,
-            "num_hidden_layers",
-            getattr(self.config, "n_layer", getattr(self.config, "num_layers", 32)),
+    def _get_num_layers(self, key: str = "num_layers") -> int:
+        """Get number of transformer layers from config using the provided key.
+        
+        Raises an error if the key is not found in config.
+        """
+        for k in ("num_hidden_layers", "n_layer", key):
+            if hasattr(self.config, k):
+                return getattr(self.config, k)
+        
+        raise ValueError(
+            f"Cannot determine number of layers. "
+            f"None of ('num_hidden_layers', 'n_layer', '{key}') found in config.\n"
+            f"Please check the model's configuration file."
         )
-
+    
+    # TODO: Complete this for other models as well 
     def _create_layer_names_dict(self) -> dict:
-        """Creates layer names dictionary based on model architecture"""
+        """Creates mapping of Architecture specific layer names to general names for inference"""
         model_arch = (
             getattr(self.config, "architectures", [""])[0]
             if hasattr(self.config, "architectures")
@@ -57,9 +73,9 @@ class ModelConfig:
             "norm": "model.norm",
             "lm_head": "lm_head",
         }
-
+    
     def _create_ordered_layer_names(self) -> list[str]:
-        """Create ordered list of layer names for forward pass execution"""
+        """Order the layer names for sequential execution"""
         layer_names = []
 
         layer_names.append(self.layer_names_dict["embed"])
@@ -74,7 +90,10 @@ class ModelConfig:
         return layer_names
 
     def _create_layer_param_mapping(self) -> dict[str, list[str]]:
-        """Create mapping from layer names to their parameter names for efficient loading"""
+        """
+        Create maps from layer names to their parameter names for efficient loading
+        Parameter are the actual weights/matrices that are learnable and makes the inference when multiplied with input sequentially
+        """
         all_param_names = self._get_all_param_names()
 
         layer_to_params = {}
@@ -89,7 +108,10 @@ class ModelConfig:
         return layer_to_params
 
     def _get_all_param_names(self) -> list[str]:
-        """Get all parameter names from model files"""
+        """
+        Scans all model files and gets a complete list of every parameter name
+        Parameter are the actual weights/matrices that are learnable and makes the inference when multiplied with input sequentially
+        """
         param_names = []
 
         for fname in os.listdir(self.model_path):
@@ -106,7 +128,10 @@ class ModelConfig:
         return list(set(param_names))
 
     def _param_belongs_to_layer(self, param_name: str, layer_name: str) -> bool:
-        """Check if a parameter belongs to a specific layer"""
+        """
+        Check if a parameter belongs to a specific layer
+        Parameter are the actual weights/matrices that are learnable and makes the inference when multiplied with input sequentially
+        """
         if layer_name.startswith(self.layer_names_dict["layer_prefix"]):
             return param_name.startswith(layer_name + ".")
 
@@ -116,7 +141,10 @@ class ModelConfig:
         )
 
     def get_layer_param_names(self, layer_name: str) -> list[str]:
-        """Get all parameter names for a specific layer"""
+        """
+        Get all parameter names for a specific layer
+        Parameter are the actual weights/matrices that are learnable and makes the inference when multiplied with input sequentially
+        """
         return self.layer_to_param_names.get(layer_name, [])
 
     def get_layer_name_by_index(self, index: int) -> str:
@@ -128,9 +156,13 @@ class ModelConfig:
         )
 
     def load_layer_state_dict(self, layer_name: str) -> dict:
-        """Load state_dict for a specific layer from model files"""
+        """
+        Load state_dict for a specific layer from model files
+        state_dict is a dictionary of Parameter Names and the Parameters
+        """
         param_names = self.get_layer_param_names(layer_name)
 
+        # As the first embedding and last lm_head layers are "tied" together (it means they are the same), instead of trying to load lm_head which doesnt exist, we load embed layer instead       
         if not param_names and layer_name == self.layer_names_dict["lm_head"]:
             embed_param = f"{self.layer_names_dict['embed']}.weight"
             all_params = self._get_all_param_names()
@@ -149,6 +181,8 @@ class ModelConfig:
                 with safe_open(path, framework="pt") as f:
                     for param_name in param_names:
                         if param_name in f.keys():
+
+                            # Setting name as lm_head.weight manually because it the parameter name actually doesnt exist and is generally "tied"
                             key = (
                                 "lm_head.weight"
                                 if layer_name == self.layer_names_dict["lm_head"]
@@ -157,11 +191,12 @@ class ModelConfig:
                             layer_state_dict[key] = f.get_tensor(param_name)
 
             elif fname.endswith(".bin"):
-                import torch
 
                 state = torch.load(path, map_location="cpu")
                 for param_name in param_names:
                     if param_name in state:
+
+                        # Setting name as lm_head.weight manually because it the parameter name actually doesnt exist and is generally "tied"
                         key = (
                             "lm_head.weight"
                             if layer_name == self.layer_names_dict["lm_head"]
