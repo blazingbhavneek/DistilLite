@@ -5,37 +5,19 @@ import tempfile
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
 import torch
+from config import DataConfig
 
 
-@dataclass(frozen=True)
-class ProcessingConfig:
-    """Immutable configuration for CSV processing."""
-
-    csv_path: str  # Path for the input CSV file
-    input_col: Optional[str]  # Column name for input data
-    output_col: Optional[
-        str
-    ]  # Column name for output data, if it doesn't exist, will be created
-    chunk_size: int  # Number of rows per chunk to be loaded from disk
-    batch_size: int  # Number of rows per batch to be processed
-    intermediate_dir: (
-        str  # Directory for storing intermediate tensor/ Output from hidden layers
-    )
-    final_output_dir: str  # Directory for final output after processing
-    save_output: bool  # Whether to save output to disk or not
-
-
-class ThreadSafeChunkProcessor:
+class DataLoader:
     """Thread-safe CSV processor with separated methods for independent execution."""
 
-    def __init__(self, config: ProcessingConfig):
+    def __init__(self, config: DataConfig):
         self.config = config
 
         self._csv_metadata = self._compute_csv_metadata()
@@ -365,7 +347,7 @@ if __name__ == "__main__":
     print("=" * 80)
 
     # Immutable configuration for processor
-    config = ProcessingConfig(
+    config = DataConfig(
         csv_path=csv_path,
         input_col="input",
         output_col="output",  # Column to save output
@@ -377,7 +359,7 @@ if __name__ == "__main__":
     )
 
     # Initialize the thread-safe chunk processor
-    processor = ThreadSafeChunkProcessor(config)
+    processor = DataLoader(config)
 
     # Process chunks using cached data
     def process_all_chunks_with_cache():
@@ -522,7 +504,7 @@ if __name__ == "__main__":
     print("\nProcessing Layer 1 (input -> intermediate tensors)...")
 
     # Configuration for layer 1 processing
-    config_layer1 = ProcessingConfig(
+    config_layer1 = DataConfig(
         csv_path=csv_path,
         input_col="input",
         output_col=None,  # Save as intermediate tensors
@@ -533,7 +515,7 @@ if __name__ == "__main__":
         save_output=True,
     )
 
-    processor_layer1 = ThreadSafeChunkProcessor(config_layer1)
+    processor_layer1 = DataLoader(config_layer1)
 
     # Process layer 1 with the same caching approach
     def process_layer1_all_chunks():
@@ -659,7 +641,7 @@ if __name__ == "__main__":
     print("\nProcessing second layer (intermediate tensors -> final output)...")
 
     # Configuration for second layer
-    config_layer2 = ProcessingConfig(
+    config_layer2 = DataConfig(
         csv_path=csv_path,
         input_col=None,  # Read from intermediate tensors
         output_col="final_output",
@@ -670,7 +652,7 @@ if __name__ == "__main__":
         save_output=True,
     )
 
-    processor_layer2 = ThreadSafeChunkProcessor(config_layer2)
+    processor_layer2 = DataLoader(config_layer2)
 
     # Process layer 2 with proper caching
     def process_layer2_all_chunks():
