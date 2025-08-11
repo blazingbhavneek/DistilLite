@@ -1,6 +1,5 @@
 import gc
 import os
-import threading
 from pathlib import Path
 from typing import Any, Dict
 
@@ -41,7 +40,7 @@ class ModelConfig:
         # List of Layers present in Model
         self.layer_names: list[str] = self._create_ordered_layer_names()
 
-        # TODO
+        # Mapping from layer names to parameter names
         self.layer_to_param_names: dict[str, list[str]] = (
             self._create_layer_param_mapping()
         )
@@ -217,18 +216,17 @@ class ModelConfig:
 
 
 class BaseExecutor:
-    """Base class for layer-by-layer model execution"""
+    """Base class for thread-safe layer-by-layer model execution"""
 
     def __init__(self, config: ModelConfig):
         self.config = config
-        self._execution_lock = threading.RLock()
+        # Simple stats without threading locks - let external systems handle thread safety if needed
         self._stats = {
             "total_executions": 0,
             "total_samples": 0,
             "layer_type_counts": {},
             "multi_layer_executions": 0,
         }
-        self._loaded_layers = {}  # Cache for loaded layers
 
     def _get_layer_type(self, layer_idx: int) -> str:
         """Determine layer type from index"""
@@ -255,7 +253,7 @@ class BaseExecutor:
 
     def load_layer_range(self, start_idx: int, end_idx: int) -> Dict[int, nn.Module]:
         """
-        Load multiple layers into memory simultaneously
+        Load multiple layers into memory - pure loading function
 
         Args:
             start_idx: Starting layer index (inclusive)
@@ -263,13 +261,15 @@ class BaseExecutor:
 
         Returns:
             Dictionary mapping layer_idx to loaded nn.Module
+
+        Note:
+            This is a pure function - no caching or cleanup.
+            External pipeline should handle memory management.
         """
         if start_idx < 0 or end_idx >= self.config.total_layers or start_idx > end_idx:
             raise ValueError(
                 f"Invalid layer range: {start_idx}-{end_idx}. Valid range: 0-{self.config.total_layers-1}"
             )
-
-        # print(f"📥 Loading layers {start_idx} to {end_idx} into memory...")
 
         # Load all state dicts at once
         layers_state_dict = self.config.load_multiple_layers_state_dict(
@@ -282,56 +282,42 @@ class BaseExecutor:
             state_dict = layers_state_dict[layer_idx]
 
             if not state_dict:
-                # print(f"  ⚠️ No state dict found for layer {layer_idx}, skipping...")
                 continue
-
-            layer_type = self._get_layer_type(layer_idx)
-            layer_name = self.config.get_layer_name_by_index(layer_idx)
-
-            # print(f"  🏗️ Creating {layer_type} layer {layer_idx}: {layer_name}")
 
             # Use subclass implementation to create layer
             layer = self.create_layer(layer_idx, state_dict)
             layer.eval()
             loaded_layers[layer_idx] = layer
 
-        # print(f"✅ Successfully loaded {len(loaded_layers)} layers")
         return loaded_layers
 
     def execute_layer_range(
         self,
-        start_idx: int,
-        end_idx: int,
+        loaded_layers: Dict[int, nn.Module],
         batch: Dict[str, torch.Tensor],
         validate_shapes: bool = True,
-        keep_layers_loaded: bool = False,
     ) -> torch.Tensor:
         """
-        Execute multiple layers sequentially on the input batch
+        Execute multiple layers sequentially using pre-loaded layers
 
         Args:
-            start_idx: Starting layer index (inclusive)
-            end_idx: Ending layer index (inclusive)
+            loaded_layers: Dictionary mapping layer_idx to loaded nn.Module
             batch: Input batch dictionary
             validate_shapes: Whether to validate input/output shapes
-            keep_layers_loaded: Whether to keep layers in memory after execution
 
         Returns:
             torch.Tensor: Output from the last layer in the range
         """
-        # Check if layers are already loaded
-        cache_key = f"{start_idx}-{end_idx}"
+        if not loaded_layers:
+            raise ValueError("loaded_layers cannot be empty")
 
-        if cache_key in self._loaded_layers:
-            # print(f"🔄 Using cached layers {start_idx} to {end_idx}")
-            loaded_layers = self._loaded_layers[cache_key]
-        else:
-            # Load layers
-            loaded_layers = self.load_layer_range(start_idx, end_idx)
-            if keep_layers_loaded:
-                self._loaded_layers[cache_key] = loaded_layers
+        layer_indices = sorted(loaded_layers.keys())
+        start_idx, end_idx = layer_indices[0], layer_indices[-1]
 
-        # print(f"⚡ Executing layers {start_idx} to {end_idx}...")
+        # Verify we have all layers in the range
+        for layer_idx in range(start_idx, end_idx + 1):
+            if layer_idx not in loaded_layers:
+                raise ValueError(f"Missing layer {layer_idx} in loaded_layers")
 
         current_batch = batch.copy()
 
@@ -357,14 +343,8 @@ class BaseExecutor:
         try:
             # Execute each layer in sequence
             for layer_idx in range(start_idx, end_idx + 1):
-                if layer_idx not in loaded_layers:
-                    # print(f"  ⚠️ Layer {layer_idx} not found in loaded layers, skipping...")
-                    continue
-
                 layer = loaded_layers[layer_idx]
                 layer_type = self._get_layer_type(layer_idx)
-
-                # print(f"  🚀 Executing layer {layer_idx} ({layer_type})")
 
                 # Validate inputs
                 if validate_shapes:
@@ -389,48 +369,15 @@ class BaseExecutor:
                 if layer_type == "embedding" and "input_ids" in current_batch:
                     del current_batch["input_ids"]
 
-                # print(f"  ✅ Layer {layer_idx} completed - Output shape: {output.shape}")
+            # Update stats (non-thread-safe - let external systems handle if needed)
+            self._update_stats(start_idx, end_idx, batch)
 
-            # Update stats
-            self._update_multi_layer_stats(start_idx, end_idx, batch)
-
-            # print(f"🎉 Layer range {start_idx}-{end_idx} execution completed!")
             return output
 
         except Exception as e:
             raise RuntimeError(
                 f"Multi-layer execution failed for range {start_idx}-{end_idx}: {str(e)}"
             ) from e
-
-        finally:
-            # Clean up if not keeping layers loaded
-            if not keep_layers_loaded and cache_key not in self._loaded_layers:
-                del loaded_layers
-                gc.collect()
-
-    def unload_layers(self, start_idx: int = None, end_idx: int = None):
-        """
-        Unload layers from memory cache
-
-        Args:
-            start_idx: Starting layer index (if None, unload all)
-            end_idx: Ending layer index (if None, unload all)
-        """
-        if start_idx is None or end_idx is None:
-            # Unload all cached layers
-            # print("🧹 Unloading all cached layers...")
-            self._loaded_layers.clear()
-        else:
-            cache_key = f"{start_idx}-{end_idx}"
-            if cache_key in self._loaded_layers:
-                # print(f"🧹 Unloading cached layers {start_idx}-{end_idx}...")
-                del self._loaded_layers[cache_key]
-            # else:
-            # print(f"⚠️ No cached layers found for range {start_idx}-{end_idx}")
-
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
     def _validate_inputs(
         self, batch: Dict[str, torch.Tensor], layer_type: str, layer_idx: int
@@ -505,58 +452,38 @@ class BaseExecutor:
                     f"{layer_type.title()} layer output shape {output.shape} doesn't match input shape {hidden_states.shape}"
                 )
 
-    def _update_multi_layer_stats(
+    def _update_stats(
         self, start_idx: int, end_idx: int, batch: Dict[str, torch.Tensor]
     ):
-        """Update execution statistics for multi-layer execution (thread-safe)"""
-        with self._execution_lock:
-            self._stats["multi_layer_executions"] += 1
+        """Update execution statistics (simple, non-thread-safe)"""
+        self._stats["multi_layer_executions"] += 1
 
-            # Count samples in batch
-            if "input_ids" in batch:
-                batch_size = batch["input_ids"].shape[0]
-            elif "hidden_states" in batch:
-                batch_size = batch["hidden_states"].shape[0]
-            else:
-                batch_size = 1
+        # Count samples in batch
+        if "input_ids" in batch:
+            batch_size = batch["input_ids"].shape[0]
+        elif "hidden_states" in batch:
+            batch_size = batch["hidden_states"].shape[0]
+        else:
+            batch_size = 1
 
-            self._stats["total_samples"] += batch_size
+        self._stats["total_samples"] += batch_size
 
-            # Count layer types in the range
-            for layer_idx in range(start_idx, end_idx + 1):
-                layer_type = self._get_layer_type(layer_idx)
-                self._stats["layer_type_counts"][layer_type] = (
-                    self._stats["layer_type_counts"].get(layer_type, 0) + 1
-                )
+        # Count layer types in the range
+        for layer_idx in range(start_idx, end_idx + 1):
+            layer_type = self._get_layer_type(layer_idx)
+            self._stats["layer_type_counts"][layer_type] = (
+                self._stats["layer_type_counts"].get(layer_type, 0) + 1
+            )
 
     def get_stats(self) -> Dict[str, Any]:
-        """Get execution statistics (thread-safe)"""
-        with self._execution_lock:
-            return self._stats.copy()
+        """Get execution statistics (non-thread-safe)"""
+        return self._stats.copy()
 
     def reset_stats(self):
-        """Reset execution statistics (thread-safe)"""
-        with self._execution_lock:
-            self._stats = {
-                "total_executions": 0,
-                "total_samples": 0,
-                "layer_type_counts": {},
-                "multi_layer_executions": 0,
-            }
-
-    def get_memory_usage(self) -> Dict[str, Any]:
-        """Get current memory usage information"""
-        memory_info = {
-            "loaded_layer_ranges": list(self._loaded_layers.keys()),
-            "total_cached_ranges": len(self._loaded_layers),
+        """Reset execution statistics (non-thread-safe)"""
+        self._stats = {
+            "total_executions": 0,
+            "total_samples": 0,
+            "layer_type_counts": {},
+            "multi_layer_executions": 0,
         }
-
-        if torch.cuda.is_available():
-            memory_info["gpu_memory_allocated"] = (
-                torch.cuda.memory_allocated() / 1024**3
-            )  # GB
-            memory_info["gpu_memory_reserved"] = (
-                torch.cuda.memory_reserved() / 1024**3
-            )  # GB
-
-        return memory_info

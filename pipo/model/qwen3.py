@@ -1,4 +1,4 @@
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -11,10 +11,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 class Qwen3Executor(BaseExecutor):
     """Qwen3-specific implementation of BaseExecutor using official Qwen3 modeling components"""
 
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, cache_position_embeddings: bool = True):
         super().__init__(config)
         self._rotary_emb = None
-        self._position_embeddings_cache = {}  # Cache position embeddings
+        self._cache_position_embeddings = cache_position_embeddings
+        self._position_embeddings_cache = {} if cache_position_embeddings else None
 
         # Initialize rotary embeddings once
         self._initialize_rotary_embeddings()
@@ -28,10 +29,13 @@ class Qwen3Executor(BaseExecutor):
 
             # Create rotary embedding using config
             self._rotary_emb = Qwen3RotaryEmbedding(config=self.config.config)
-            # print("✅ Initialized Qwen3 rotary embeddings")
         except ImportError as e:
-            # print(f"⚠️ Could not import Qwen3RotaryEmbedding: {e}")
             self._rotary_emb = None
+
+    def clear_position_embeddings_cache(self):
+        """Clear position embeddings cache - useful for thread safety or memory management"""
+        if self._position_embeddings_cache is not None:
+            self._position_embeddings_cache.clear()
 
     def _compute_position_embeddings(
         self, batch: Dict[str, torch.Tensor]
@@ -61,21 +65,26 @@ class Qwen3Executor(BaseExecutor):
                 .expand(batch_size, -1)
             )
 
-        # Create cache key
-        cache_key = (
-            device.type,
-            batch_size,
-            seq_len,
-            (
-                tuple(position_ids.flatten().tolist())
-                if position_ids.numel() < 100
-                else None
-            ),
-        )
+        # Use caching if enabled
+        if (
+            self._cache_position_embeddings
+            and self._position_embeddings_cache is not None
+        ):
+            # Create cache key
+            cache_key = (
+                device.type,
+                batch_size,
+                seq_len,
+                (
+                    tuple(position_ids.flatten().tolist())
+                    if position_ids.numel() < 100
+                    else None
+                ),
+            )
 
-        # Check cache first
-        if cache_key in self._position_embeddings_cache:
-            return self._position_embeddings_cache[cache_key]
+            # Check cache first
+            if cache_key in self._position_embeddings_cache:
+                return self._position_embeddings_cache[cache_key]
 
         # Compute position embeddings using Qwen3RotaryEmbedding
         with torch.no_grad():
@@ -89,8 +98,22 @@ class Qwen3Executor(BaseExecutor):
             )
             cos, sin = self._rotary_emb(dummy_tensor, position_ids)
 
-        # Cache the result (limit cache size)
-        if len(self._position_embeddings_cache) < 100:
+        # Cache the result if caching is enabled (limit cache size)
+        if (
+            self._cache_position_embeddings
+            and self._position_embeddings_cache is not None
+            and len(self._position_embeddings_cache) < 100
+        ):
+            cache_key = (
+                device.type,
+                batch_size,
+                seq_len,
+                (
+                    tuple(position_ids.flatten().tolist())
+                    if position_ids.numel() < 100
+                    else None
+                ),
+            )
             self._position_embeddings_cache[cache_key] = (cos, sin)
 
         return cos, sin
@@ -170,7 +193,6 @@ class Qwen3Executor(BaseExecutor):
                             current_module, param_attr, "cpu", value=param_tensor
                         )
                 except AttributeError:
-                    # print(f"Warning: Could not load parameter {param_name}")
                     continue
 
         return layer
@@ -273,7 +295,6 @@ class Qwen3Executor(BaseExecutor):
                     attention_mask = attention_mask.to(hidden_states.dtype)
 
             # Create causal mask mapping as expected by Qwen3DecoderLayer
-            # For simplicity, we'll use the same mask for all attention types
             if isinstance(attention_mask, dict):
                 causal_mask_mapping = attention_mask
             else:
@@ -297,7 +318,6 @@ class Qwen3Executor(BaseExecutor):
                     causal_mask_mapping = {"full_attention": causal_mask}
                 except Exception as e:
                     # Fallback: use the original attention mask
-                    # print(f"Warning: Could not create causal mask, using original: {e}")
                     causal_mask_mapping = {"full_attention": attention_mask}
 
             # Get the appropriate mask for this layer
@@ -323,7 +343,6 @@ class Qwen3Executor(BaseExecutor):
                 position_embeddings=position_embeddings,
             )
         except TypeError as e:
-            # print(f"Warning: Full signature failed, trying simplified: {e}")
             try:
                 # Fallback: try with minimal required arguments
                 output = layer(
@@ -333,7 +352,6 @@ class Qwen3Executor(BaseExecutor):
                 )
             except Exception as e2:
                 # Last resort: just hidden states
-                # print(f"Warning: Simplified signature failed, using minimal: {e2}")
                 output = layer(hidden_states)
 
         # Handle tuple returns
@@ -391,8 +409,17 @@ if __name__ == "__main__":
         for i in range(0, config.total_layers, group_size)
     ]
 
+    # Pre-load all layer ranges (simulating external pipeline handling memory)
+    loaded_layer_ranges = {}
+    print("Loading all layer ranges...")
+    for start_idx, end_idx in layer_ranges:
+        print(f"Loading layers {start_idx}-{end_idx}...")
+        loaded_layer_ranges[(start_idx, end_idx)] = executor.load_layer_range(
+            start_idx, end_idx
+        )
+
     # -------------------------------
-    # Phase 1: Custom Executor run
+    # Phase 1: Custom Executor run with pre-loaded layers
     # -------------------------------
     custom_logits_list = []
     custom_tokens_list = []
@@ -400,7 +427,7 @@ if __name__ == "__main__":
     seq_ids = input_ids_initial.clone()
     attn_mask = attention_mask_initial.clone()
 
-    print("\n--- Phase 1: Custom Executor ---")
+    print("\n--- Phase 1: Custom Executor with Pre-loaded Layers ---")
     for step in range(max_new_tokens):
         pos_ids = (
             torch.arange(seq_ids.shape[1], dtype=torch.long)
@@ -416,12 +443,13 @@ if __name__ == "__main__":
 
         final_logits = None
         for start_idx, end_idx in layer_ranges:
+            # Use pre-loaded layers
+            loaded_layers = loaded_layer_ranges[(start_idx, end_idx)]
+
             final_logits = executor.execute_layer_range(
-                start_idx=start_idx,
-                end_idx=end_idx,
+                loaded_layers=loaded_layers,
                 batch=batch_step,
                 validate_shapes=False,
-                keep_layers_loaded=True,
             )
             if end_idx < config.total_layers - 1:
                 batch_step["hidden_states"] = final_logits
@@ -439,7 +467,12 @@ if __name__ == "__main__":
             [attn_mask, torch.ones_like(next_tokens).unsqueeze(1)], dim=1
         )
 
-    executor.unload_layers()
+    # Clean up pre-loaded layers (simulating external pipeline cleanup)
+    print("Cleaning up pre-loaded layers...")
+    del loaded_layer_ranges
+    import gc
+
+    gc.collect()
 
     # -------------------------------
     # Phase 2: HF run
