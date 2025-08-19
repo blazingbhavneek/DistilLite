@@ -4,8 +4,9 @@ import torch
 import torch.nn as nn
 from accelerate import init_empty_weights
 from accelerate.utils.modeling import set_module_tensor_to_device
-from base import BaseExecutor, ModelConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from .base import BaseExecutor, ModelConfig
 
 
 class Qwen3Executor(BaseExecutor):

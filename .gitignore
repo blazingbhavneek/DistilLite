@@ -6,3 +6,5 @@
 *.env
 *.DS_Store
 */results/
+*orchestrator_outputs/
+*/datagen/results/

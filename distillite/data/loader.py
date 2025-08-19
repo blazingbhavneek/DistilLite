@@ -11,7 +11,8 @@ from typing import Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 import torch
-from config import DataConfig
+
+from .config import DataConfig
 
 
 class DataLoader:
