@@ -33,7 +33,7 @@ class InferenceOrchestrator:
         max_workers: int = 2,
         max_seq_length: int = 512,
         intermediate_size_threshold_gb: float = 0.2,
-        memory_utilization: float = 0.3,
+        memory_utilization: float = 0.7,
     ):
         """
         Initialize orchestrator with injected dependencies.
