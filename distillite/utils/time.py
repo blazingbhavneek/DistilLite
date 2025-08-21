@@ -1,6 +1,6 @@
 import time
 
-from log import log
+from distillite.utils import log
 
 
 def measure_time(func):
