@@ -32,7 +32,7 @@ class InferenceOrchestrator:
         executor: "BaseExecutor",
         max_workers: int = 2,
         max_seq_length: int = 512,
-        intermediate_size_threshold_gb: float = 0.2,
+        intermediate_size_threshold_gb: float = 10,
         memory_utilization: float = 0.7,
     ):
         """
