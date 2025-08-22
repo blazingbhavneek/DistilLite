@@ -19,9 +19,9 @@ from distillite.utils import available_memory
 
 class InferenceOrchestrator:
     """
-    Multi-stage inference orchestrator that coordinates thread-safe DataLoader and Executor
+    Multi-stage inference orchestrator with GPU/CPU support that coordinates thread-safe DataLoader and Executor
     for memory-efficient processing of large datasets through transformer models with wave-based
-    disk space management.
+    disk space management and CUDA memory optimization.
     """
 
     def __init__(
@@ -30,6 +30,7 @@ class InferenceOrchestrator:
         data_loader: "DataLoader",
         model_config: "ModelConfig",
         executor: "BaseExecutor",
+        device: str = "auto",
         max_workers: int = 2,
         max_seq_length: int = 512,
         intermediate_size_threshold_gb: float = 10,
@@ -43,10 +44,11 @@ class InferenceOrchestrator:
             data_loader: Thread-safe data loader instance
             model_config: Model configuration
             executor: Thread-safe model executor (inherits from BaseExecutor)
+            device: Device to use ('cuda', 'cpu', or 'auto' for auto-detection)
             max_workers: Maximum workers for thread pools
             max_seq_length: Maximum sequence length for tokenization
             intermediate_size_threshold_gb: Disk space threshold in GB for intermediate files
-            memory_utilization: Fraction of available GPU memory to use (0.0-1.0, default 0.8)
+            memory_utilization: Fraction of available GPU memory to use (0.0-1.0, default 0.7)
         """
         self.data_config = data_config
         self.data_loader = data_loader
@@ -56,6 +58,8 @@ class InferenceOrchestrator:
         self.max_seq_length = max_seq_length
         self.intermediate_size_threshold_gb = intermediate_size_threshold_gb
         self.memory_utilization = max(0.1, min(1.0, memory_utilization))
+
+        self.device = self._setup_device(device)
 
         self._initialize_tokenizer()
 
@@ -78,10 +82,74 @@ class InferenceOrchestrator:
 
         print(f"   📊 Dataset: {data_config.csv_path}")
         print(f"   🤖 Model: {model_config.model_path}")
+        print(f"   🎮 Device: {self.device}")
+        if self.device.startswith("cuda"):
+            gpu_name = torch.cuda.get_device_name(self.device)
+            gpu_memory = (
+                torch.cuda.get_device_properties(self.device).total_memory / 1024**3
+            )
+            print(f"   🎮 GPU: {gpu_name} ({gpu_memory:.1f} GB)")
         print(f"   💾 Intermediate dir: {self.intermediate_dir}")
         print(f"   📏 Max sequence length: {self.max_seq_length}")
         print(f"   🌊 Wave threshold: {self.intermediate_size_threshold_gb:.1f} GB")
         print(f"   🧠 Memory utilization: {self.memory_utilization*100:.1f}%")
+
+    def _setup_device(self, device: str) -> str:
+        """Setup and validate device for inference."""
+        if device == "auto":
+            if torch.cuda.is_available():
+                device = "cuda"
+                print(f"   🎮 Auto-detected CUDA device")
+            else:
+                device = "cpu"
+                print(f"   🎮 CUDA not available, using CPU")
+
+        if device.startswith("cuda"):
+            if not torch.cuda.is_available():
+                print(f"   ⚠️  CUDA requested but not available, falling back to CPU")
+                device = "cpu"
+            else:
+                try:
+                    torch.cuda.empty_cache()
+                    _ = torch.zeros(1, device=device)
+                    print(f"   ✅ GPU device {device} is accessible")
+                except Exception as e:
+                    print(f"   ⚠️  GPU device {device} not accessible: {e}, using CPU")
+                    device = "cpu"
+
+        return device
+
+    def _clear_gpu_memory(self):
+        """Clear GPU memory and cache."""
+        if self.device.startswith("cuda"):
+            torch.cuda.empty_cache()
+            gc.collect()
+            if hasattr(torch.cuda, "reset_peak_memory_stats"):
+                torch.cuda.reset_peak_memory_stats()
+
+    def _get_gpu_memory_info(self) -> Dict[str, float]:
+        """Get current GPU memory usage in GB."""
+        if not self.device.startswith("cuda"):
+            return {"total": 0, "allocated": 0, "cached": 0, "free": 0}
+
+        total = torch.cuda.get_device_properties(self.device).total_memory / 1024**3
+        allocated = torch.cuda.memory_allocated(self.device) / 1024**3
+        cached = torch.cuda.memory_reserved(self.device) / 1024**3
+        free = total - allocated
+
+        return {"total": total, "allocated": allocated, "cached": cached, "free": free}
+
+    def _move_to_device(
+        self, tensor_dict: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        """Move tensor dictionary to the target device."""
+        result = {}
+        for key, value in tensor_dict.items():
+            if isinstance(value, torch.Tensor):
+                result[key] = value.to(self.device, non_blocking=True)
+            else:
+                result[key] = value
+        return result
 
     def _initialize_tokenizer(self):
         """Initialize tokenizer for text processing."""
@@ -112,6 +180,8 @@ class InferenceOrchestrator:
         print(f"\n🔍 DEBUG: Single-stage comparison with HF model...")
 
         try:
+            self._clear_gpu_memory()
+
             test_data = self.data_loader.load_chunk(0)[:test_samples]
 
             print(
@@ -121,9 +191,22 @@ class InferenceOrchestrator:
                 0, self.model_config.total_layers - 1
             )
 
-            hf_model = AutoModelForCausalLM.from_pretrained(
-                self.model_config.model_path, trust_remote_code=True
-            ).eval()
+            print(f"   🔄 Loading HF model to {self.device}...")
+            hf_model = (
+                AutoModelForCausalLM.from_pretrained(
+                    self.model_config.model_path,
+                    trust_remote_code=True,
+                    torch_dtype=torch.float32,
+                )
+                .to(self.device)
+                .eval()
+            )
+
+            if self.device.startswith("cuda"):
+                mem_info = self._get_gpu_memory_info()
+                print(
+                    f"   🎮 GPU memory after model loading: {mem_info['allocated']:.1f}GB allocated, {mem_info['free']:.1f}GB free"
+                )
 
             matches = 0
             total_samples = len(test_data)
@@ -151,6 +234,9 @@ class InferenceOrchestrator:
                     "attention_mask": tokenized["attention_mask"],
                     "position_ids": position_ids,
                 }
+
+                executor_input = self._move_to_device(executor_input)
+                tokenized = self._move_to_device(tokenized)
 
                 orchestrator_output = self.executor.execute_layer_range(
                     loaded_layers=all_layers,
@@ -203,36 +289,349 @@ class InferenceOrchestrator:
                 )
 
             del all_layers, hf_model
-            gc.collect()
+            self._clear_gpu_memory()
 
             return is_working
 
         except Exception as e:
             print(f"      ❌ Debug comparison failed: {e}")
             traceback.print_exc()
+            self._clear_gpu_memory()
             return False
+
+    def _tokenize_batch(self, batch_data: Any) -> Dict[str, torch.Tensor]:
+        """
+        Tokenize a batch of text data and move to device.
+        """
+        tokenizer = self.executor.tokenizer
+
+        if isinstance(batch_data, np.ndarray):
+            text_list = [str(text) for text in batch_data.tolist()]
+        elif isinstance(batch_data, (list, tuple)):
+            text_list = [str(text) for text in batch_data]
+        else:
+            text_list = [str(batch_data)]
+
+        print(f"       🔤 Tokenizing {len(text_list)} texts...")
+        print(f"       📝 Sample text: '{text_list[0][:80]}...'")
+
+        tokenized = tokenizer(
+            text_list,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.max_seq_length,
+        )
+
+        batch_size, seq_len = tokenized["input_ids"].shape
+        position_ids = (
+            torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+        )
+
+        result = {
+            "input_ids": tokenized["input_ids"],
+            "attention_mask": tokenized["attention_mask"],
+            "position_ids": position_ids,
+        }
+
+        result = self._move_to_device(result)
+
+        print(f"       📊 Tokenized shape: {result['input_ids'].shape}")
+        print(f"       🔢 Sequence length: {result['input_ids'].shape[1]}")
+        print(f"       🎯 Position IDs shape: {result['position_ids'].shape}")
+        print(f"       🎮 Device: {result['input_ids'].device}")
+
+        return result
+
+    def _process_stage_from_text(
+        self, chunk_data: Any, loaded_layers: Any, chunk_idx: int, stage_idx: int
+    ) -> Dict[str, Any]:
+        """
+        Process first stage from text data with GPU optimization.
+        """
+        batch_size = self.data_config.batch_size
+        num_batches = (len(chunk_data) + batch_size - 1) // batch_size
+
+        batch_outputs = []
+        batch_metadata = []
+
+        print(f"       🔄 Processing {num_batches} batches from text...")
+
+        for batch_idx in range(num_batches):
+            batch_result = self.data_loader.get_batch(chunk_data, batch_idx)
+            if batch_result is None:
+                break
+
+            batch_data, start_idx, end_idx = batch_result
+            print(
+                f"       [Batch {batch_idx + 1}/{num_batches}] Indices {start_idx}-{end_idx-1}"
+            )
+
+            executor_input = self._tokenize_batch(batch_data)
+
+            if self.device.startswith("cuda"):
+                mem_before = self._get_gpu_memory_info()
+                print(
+                    f"       🎮 GPU memory before inference: {mem_before['allocated']:.1f}GB"
+                )
+
+            print(f"       💻 Executing inference on batch...")
+            batch_output = self.executor.execute_layer_range(
+                loaded_layers=loaded_layers, batch=executor_input, validate_shapes=False
+            )
+
+            if self.device.startswith("cuda"):
+                mem_after = self._get_gpu_memory_info()
+                print(
+                    f"       🎮 GPU memory after inference: {mem_after['allocated']:.1f}GB"
+                )
+
+            print(f"       📊 Output shape: {batch_output.shape}")
+            print(f"       🎮 Output device: {batch_output.device}")
+
+            batch_output_cpu = batch_output.cpu()
+            executor_input_cpu = {
+                k: v.cpu() if isinstance(v, torch.Tensor) else v
+                for k, v in executor_input.items()
+            }
+
+            batch_outputs.append(batch_output_cpu)
+            batch_metadata.append(
+                {
+                    "batch_idx": batch_idx,
+                    "start_idx": start_idx,
+                    "end_idx": end_idx,
+                    "output_shape": batch_output_cpu.shape,
+                    "attention_mask": executor_input_cpu["attention_mask"],
+                    "position_ids": executor_input_cpu["position_ids"],
+                }
+            )
+
+            del batch_output, executor_input
+            if self.device.startswith("cuda"):
+                torch.cuda.empty_cache()
+
+            print(f"       ✅ Batch {batch_idx + 1} complete")
+
+        return {
+            "batch_outputs": batch_outputs,
+            "batch_metadata": batch_metadata,
+            "chunk_size": len(chunk_data),
+        }
+
+    def _process_stage_from_intermediate(
+        self, loaded_layers: Any, chunk_idx: int, stage_idx: int
+    ) -> Dict[str, Any]:
+        """
+        Process subsequent stages from intermediate hidden states with GPU optimization.
+        """
+        intermediate_path = self._get_intermediate_path(chunk_idx)
+
+        if not intermediate_path.exists():
+            raise FileNotFoundError(f"Intermediate file not found: {intermediate_path}")
+
+        with open(intermediate_path, "rb") as f:
+            prev_results = pickle.load(f)
+
+        batch_outputs = []
+        batch_metadata = []
+
+        print(
+            f"       🔄 Processing {len(prev_results['batch_outputs'])} batches from intermediate..."
+        )
+
+        for batch_idx, (prev_output, prev_metadata) in enumerate(
+            zip(prev_results["batch_outputs"], prev_results["batch_metadata"])
+        ):
+            print(f"       [Batch {batch_idx + 1}] Processing hidden states...")
+
+            executor_input = {
+                "hidden_states": prev_output,
+                "attention_mask": prev_metadata.get("attention_mask"),
+                "position_ids": prev_metadata.get("position_ids"),
+            }
+
+            if (
+                executor_input["attention_mask"] is None
+                or executor_input["position_ids"] is None
+            ):
+                raise ValueError(
+                    f"Missing attention context in stage {stage_idx}, batch {batch_idx}"
+                )
+
+            executor_input = self._move_to_device(executor_input)
+
+            if self.device.startswith("cuda"):
+                mem_before = self._get_gpu_memory_info()
+                print(
+                    f"       🎮 GPU memory before inference: {mem_before['allocated']:.1f}GB"
+                )
+
+            print(f"       💻 Executing inference on batch with preserved context...")
+            batch_output = self.executor.execute_layer_range(
+                loaded_layers=loaded_layers, batch=executor_input, validate_shapes=False
+            )
+
+            if self.device.startswith("cuda"):
+                mem_after = self._get_gpu_memory_info()
+                print(
+                    f"       🎮 GPU memory after inference: {mem_after['allocated']:.1f}GB"
+                )
+
+            print(f"       📊 Output shape: {batch_output.shape}")
+
+            batch_output_cpu = batch_output.cpu()
+            executor_input_cpu = {
+                k: v.cpu() if isinstance(v, torch.Tensor) else v
+                for k, v in executor_input.items()
+            }
+
+            batch_outputs.append(batch_output_cpu)
+            batch_metadata.append(
+                {
+                    "batch_idx": batch_idx,
+                    "start_idx": prev_metadata["start_idx"],
+                    "end_idx": prev_metadata["end_idx"],
+                    "output_shape": batch_output_cpu.shape,
+                    "attention_mask": executor_input_cpu["attention_mask"],
+                    "position_ids": executor_input_cpu["position_ids"],
+                }
+            )
+
+            del batch_output, executor_input
+            if self.device.startswith("cuda"):
+                torch.cuda.empty_cache()
+
+            print(f"       ✅ Batch {batch_idx + 1} complete")
+
+        return {
+            "batch_outputs": batch_outputs,
+            "batch_metadata": batch_metadata,
+            "chunk_size": prev_results["chunk_size"],
+        }
+
+    def _calculate_layer_groups(self) -> List[Tuple[int, int]]:
+        """Calculate optimal layer groupings based on available GPU memory."""
+        try:
+            if self.device.startswith("cuda"):
+                gpu_memory_gb = (
+                    torch.cuda.get_device_properties(self.device).total_memory / 1024**3
+                )
+                current_allocated = torch.cuda.memory_allocated(self.device) / 1024**3
+                available_gpu_memory = gpu_memory_gb - current_allocated
+            else:
+                memory_info = self._get_available_memory()
+                gpu_memory_gb = 0
+                if memory_info.get("available_gpus"):
+                    gpu_memory_gb = (
+                        memory_info["available_gpus"][0]["memoryFree"] / 1024
+                    )
+                else:
+                    gpu_memory_gb = 8
+                available_gpu_memory = gpu_memory_gb
+        except Exception as e:
+            print(f"   ⚠️  Could not get GPU memory info: {e}")
+            gpu_memory_gb = 8
+            available_gpu_memory = 8
+
+        usable_memory_gb = available_gpu_memory * self.memory_utilization
+
+        print(f"   🧠 Total GPU memory: {gpu_memory_gb:.1f} GB")
+        print(f"   🧠 Available GPU memory: {available_gpu_memory:.1f} GB")
+        print(
+            f"   🧠 Usable memory ({self.memory_utilization*100:.1f}%): {usable_memory_gb:.1f} GB"
+        )
+
+        total_layers = self.model_config.total_layers
+
+        if usable_memory_gb > 20:
+            layers_per_group = min(16, total_layers)
+        elif usable_memory_gb > 16:
+            layers_per_group = min(8, total_layers)
+        elif usable_memory_gb > 8:
+            layers_per_group = min(4, total_layers)
+        elif usable_memory_gb > 4:
+            layers_per_group = min(2, total_layers)
+        elif usable_memory_gb > 2:
+            layers_per_group = 1
+        else:
+            layers_per_group = 1
+            print(
+                f"   ⚠️  Warning: Very low usable memory ({usable_memory_gb:.1f} GB). Consider reducing batch size."
+            )
+
+        groups = []
+        for i in range(0, total_layers, layers_per_group):
+            end_layer = min(i + layers_per_group - 1, total_layers - 1)
+            groups.append((i, end_layer))
+
+        print(
+            f"   📊 Calculated {layers_per_group} layers per group based on {usable_memory_gb:.1f} GB usable memory"
+        )
+
+        return groups
+
+    def _get_available_memory(self) -> Dict[str, Any]:
+        """Fallback memory check if utility not available."""
+        return {
+            "available_ram": 16.0,
+            "available_disk": 100.0,
+            "available_gpus": [{"name": "GPU", "memoryFree": 8192}],
+        }
+
+    def _cleanup(self):
+        """Clean up resources and clear GPU memory."""
+        print("\n🧹 Cleaning up resources...")
+
+        self.data_pool.shutdown(wait=True)
+        self.model_pool.shutdown(wait=True)
+
+        self._clear_gpu_memory()
+
+        try:
+            cleaned_count = 0
+            for file_path in self.active_intermediate_files.copy():
+                if Path(file_path).exists():
+                    Path(file_path).unlink()
+                    cleaned_count += 1
+                self.active_intermediate_files.discard(file_path)
+
+            if cleaned_count > 0:
+                print(f"   🗑️  Removed {cleaned_count} remaining intermediate files")
+            else:
+                print(f"   ✅ No intermediate files to clean (already removed)")
+
+        except Exception as e:
+            print(f"   ⚠️  Warning: Could not clean intermediate files: {e}")
+
+        if self.device.startswith("cuda"):
+            final_mem = self._get_gpu_memory_info()
+            print(f"   🎮 Final GPU memory: {final_mem['allocated']:.1f}GB allocated")
+
+        print(f"   💽 Storage optimization: Wave-based disk space management")
+        print(f"   🔧 Context preservation: Maintained attention consistency")
+        print(
+            f"   🧠 Memory optimization: {self.memory_utilization*100:.1f}% GPU utilization"
+        )
 
     def run(self, debug_first: bool = True) -> str:
         """
-        Execute the complete inference orchestrator with wave-based disk management.
-
-        Args:
-            debug_first: If True, run single-stage debug comparison first
-
-        Returns:
-            str: Path to final output directory containing individual chunk files
+        Execute the complete inference orchestrator with GPU optimization.
         """
-        print("\n🚀 Starting wave-based memory-optimized inference orchestrator...")
+        print(f"\n🚀 Starting wave-based memory-optimized inference orchestrator...")
         start_time = time.time()
+
+        if self.device.startswith("cuda"):
+            initial_mem = self._get_gpu_memory_info()
+            print(
+                f"   🎮 Initial GPU memory: {initial_mem['allocated']:.1f}GB allocated, {initial_mem['free']:.1f}GB free"
+            )
 
         if debug_first:
             print("\n🔍 Running pre-flight debug check...")
             if not self.debug_single_stage_comparison(test_samples=3):
                 print(
                     "❌ Single-stage debug failed. Please fix executor before proceeding."
-                )
-                print(
-                    "💡 Hint: Check if your executor properly handles input_ids, attention_mask, and position_ids"
                 )
                 return None
             print(
@@ -244,6 +643,7 @@ class InferenceOrchestrator:
             print(f"\n📋 Execution plan:")
             print(f"   🎯 {len(layer_groups)} stages")
             print(f"   📦 {self.data_loader.num_chunks} total chunks")
+            print(f"   🎮 Device: {self.device}")
             print(
                 f"   🌊 Wave-based processing with {self.intermediate_size_threshold_gb:.1f} GB threshold"
             )
@@ -257,7 +657,7 @@ class InferenceOrchestrator:
             final_output_dir = self._execute_wave_based_orchestrator(layer_groups)
 
             total_time = time.time() - start_time
-            print(f"\n✅ Wave-based orchestrator complete in {total_time:.2f}s!")
+            print(f"\n✅ GPU-optimized orchestrator complete in {total_time:.2f}s!")
             print(f"📁 Final outputs directory: {final_output_dir}")
             return final_output_dir
 
@@ -268,7 +668,7 @@ class InferenceOrchestrator:
         self, layer_groups: List[Tuple[int, int]]
     ) -> str:
         """
-        Execute orchestrator using wave-based processing to manage disk space.
+        Execute orchestrator using wave-based processing to manage disk space with GPU optimization.
         """
         print(f"\n🌊 Starting wave-based processing...")
 
@@ -289,6 +689,12 @@ class InferenceOrchestrator:
                 f"   💾 Intermediate threshold: {self.intermediate_size_threshold_gb:.1f} GB"
             )
 
+            if self.device.startswith("cuda"):
+                mem_info = self._get_gpu_memory_info()
+                print(
+                    f"   🎮 Wave start GPU memory: {mem_info['allocated']:.1f}GB allocated"
+                )
+
             self._process_wave_through_all_stages(
                 wave_chunks, processed_chunks, layer_groups
             )
@@ -297,6 +703,14 @@ class InferenceOrchestrator:
             wave_number += 1
 
             self._cleanup_intermediate_files()
+
+            self._clear_gpu_memory()
+
+            if self.device.startswith("cuda"):
+                mem_info = self._get_gpu_memory_info()
+                print(
+                    f"   🎮 Wave end GPU memory: {mem_info['allocated']:.1f}GB allocated"
+                )
 
             print(f"   ✅ Wave {wave_number-1} completed, intermediates cleaned")
 
@@ -347,7 +761,7 @@ class InferenceOrchestrator:
         layer_groups: List[Tuple[int, int]],
     ):
         """
-        Process a wave of chunks through all stages sequentially.
+        Process a wave of chunks through all stages sequentially with GPU optimization.
         """
         current_loaded_layers = None
 
@@ -361,15 +775,30 @@ class InferenceOrchestrator:
 
             if current_loaded_layers is not None:
                 del current_loaded_layers
-                gc.collect()
+                self._clear_gpu_memory()
+
+            if self.device.startswith("cuda"):
+                mem_before = self._get_gpu_memory_info()
+                print(
+                    f"     🎮 GPU memory before loading layers: {mem_before['allocated']:.1f}GB"
+                )
 
             print(f"     🔄 Loading layers {start_layer}-{end_layer}...")
             current_loaded_layers = self.executor.load_layer_range(
                 start_layer, end_layer
             )
+
+            if self.device.startswith("cuda"):
+                mem_after = self._get_gpu_memory_info()
+                print(
+                    f"     🎮 GPU memory after loading layers: {mem_after['allocated']:.1f}GB"
+                )
+
             print(f"     ✅ Layers loaded")
 
             for chunk_idx in wave_chunks:
+                print(f"     📦 Processing chunk {chunk_idx}...")
+
                 if stage_idx == 0:
                     chunk_data = self.data_loader.load_chunk(chunk_idx)
                     stage_results = self._process_stage_from_text(
@@ -391,8 +820,17 @@ class InferenceOrchestrator:
                         stage_results, chunk_idx, stage_idx
                     )
 
+                if self.device.startswith("cuda"):
+                    torch.cuda.empty_cache()
+
             current_size_gb = self._get_intermediate_folder_size_gb()
             print(f"   💾 Current intermediate folder size: {current_size_gb:.2f} GB")
+
+            if self.device.startswith("cuda"):
+                mem_stage_end = self._get_gpu_memory_info()
+                print(
+                    f"   🎮 GPU memory after stage: {mem_stage_end['allocated']:.1f}GB"
+                )
 
             if not is_final_stage:
                 print(
@@ -401,196 +839,7 @@ class InferenceOrchestrator:
 
         if current_loaded_layers is not None:
             del current_loaded_layers
-            gc.collect()
-
-    def _get_intermediate_folder_size_gb(self) -> float:
-        """Get the current size of intermediate folder in GB."""
-        total_size = 0
-        try:
-            for file_path in self.intermediate_dir.glob("**/*"):
-                if file_path.is_file():
-                    total_size += file_path.stat().st_size
-        except Exception as e:
-            print(f"   ⚠️  Warning: Could not calculate folder size: {e}")
-            return 0.0
-
-        return total_size / (1024 * 1024 * 1024)
-
-    def _cleanup_intermediate_files(self):
-        """Clean up all intermediate files after wave completion."""
-        cleaned_count = 0
-        try:
-            for file_path in self.intermediate_dir.glob("**/*"):
-                if file_path.is_file() and file_path.suffix == ".pkl":
-                    file_path.unlink()
-                    cleaned_count += 1
-
-            self.active_intermediate_files.clear()
-
-            if cleaned_count > 0:
-                print(f"     🗑️  Cleaned {cleaned_count} intermediate files")
-
-        except Exception as e:
-            print(f"     ⚠️  Warning: Could not clean intermediate files: {e}")
-
-    def _process_stage_from_text(
-        self, chunk_data: Any, loaded_layers: Any, chunk_idx: int, stage_idx: int
-    ) -> Dict[str, Any]:
-        """
-        Process first stage from text data.
-        """
-        batch_size = self.data_config.batch_size
-        num_batches = (len(chunk_data) + batch_size - 1) // batch_size
-
-        batch_outputs = []
-        batch_metadata = []
-
-        print(f"       🔄 Processing {num_batches} batches from text...")
-
-        for batch_idx in range(num_batches):
-            batch_result = self.data_loader.get_batch(chunk_data, batch_idx)
-            if batch_result is None:
-                break
-
-            batch_data, start_idx, end_idx = batch_result
-            print(
-                f"       [Batch {batch_idx + 1}/{num_batches}] Indices {start_idx}-{end_idx-1}"
-            )
-
-            executor_input = self._tokenize_batch(batch_data)
-
-            print(f"       💻 Executing inference on batch...")
-            batch_output = self.executor.execute_layer_range(
-                loaded_layers=loaded_layers, batch=executor_input, validate_shapes=False
-            )
-
-            print(f"       📊 Output shape: {batch_output.shape}")
-
-            batch_outputs.append(batch_output)
-            batch_metadata.append(
-                {
-                    "batch_idx": batch_idx,
-                    "start_idx": start_idx,
-                    "end_idx": end_idx,
-                    "output_shape": batch_output.shape,
-                    "attention_mask": executor_input["attention_mask"],
-                    "position_ids": executor_input["position_ids"],
-                }
-            )
-
-            print(f"       ✅ Batch {batch_idx + 1} complete")
-
-        return {
-            "batch_outputs": batch_outputs,
-            "batch_metadata": batch_metadata,
-            "chunk_size": len(chunk_data),
-        }
-
-    def _process_stage_from_intermediate(
-        self, loaded_layers: Any, chunk_idx: int, stage_idx: int
-    ) -> Dict[str, Any]:
-        """
-        Process subsequent stages from intermediate hidden states.
-        """
-        intermediate_path = self._get_intermediate_path(chunk_idx)
-
-        if not intermediate_path.exists():
-            raise FileNotFoundError(f"Intermediate file not found: {intermediate_path}")
-
-        with open(intermediate_path, "rb") as f:
-            prev_results = pickle.load(f)
-
-        batch_outputs = []
-        batch_metadata = []
-
-        print(
-            f"       🔄 Processing {len(prev_results['batch_outputs'])} batches from intermediate..."
-        )
-
-        for batch_idx, (prev_output, prev_metadata) in enumerate(
-            zip(prev_results["batch_outputs"], prev_results["batch_metadata"])
-        ):
-            print(f"       [Batch {batch_idx + 1}] Processing hidden states...")
-
-            executor_input = {
-                "hidden_states": prev_output,
-                "attention_mask": prev_metadata.get("attention_mask"),
-                "position_ids": prev_metadata.get("position_ids"),
-            }
-
-            if (
-                executor_input["attention_mask"] is None
-                or executor_input["position_ids"] is None
-            ):
-                raise ValueError(
-                    f"Missing attention context in stage {stage_idx}, batch {batch_idx}"
-                )
-
-            print(f"       💻 Executing inference on batch with preserved context...")
-            batch_output = self.executor.execute_layer_range(
-                loaded_layers=loaded_layers, batch=executor_input, validate_shapes=False
-            )
-
-            print(f"       📊 Output shape: {batch_output.shape}")
-
-            batch_outputs.append(batch_output)
-            batch_metadata.append(
-                {
-                    "batch_idx": batch_idx,
-                    "start_idx": prev_metadata["start_idx"],
-                    "end_idx": prev_metadata["end_idx"],
-                    "output_shape": batch_output.shape,
-                    "attention_mask": prev_metadata.get("attention_mask"),
-                    "position_ids": prev_metadata.get("position_ids"),
-                }
-            )
-
-            print(f"       ✅ Batch {batch_idx + 1} complete")
-
-        return {
-            "batch_outputs": batch_outputs,
-            "batch_metadata": batch_metadata,
-            "chunk_size": prev_results["chunk_size"],
-        }
-
-    def _tokenize_batch(self, batch_data: Any) -> Dict[str, torch.Tensor]:
-        """
-        Tokenize a batch of text data.
-        """
-        tokenizer = self.executor.tokenizer
-
-        if isinstance(batch_data, np.ndarray):
-            text_list = [str(text) for text in batch_data.tolist()]
-        elif isinstance(batch_data, (list, tuple)):
-            text_list = [str(text) for text in batch_data]
-        else:
-            text_list = [str(batch_data)]
-
-        print(f"       🔤 Tokenizing {len(text_list)} texts...")
-        print(f"       📝 Sample text: '{text_list[0][:80]}...'")
-
-        tokenized = tokenizer(
-            text_list,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.max_seq_length,
-        )
-
-        batch_size, seq_len = tokenized["input_ids"].shape
-        position_ids = (
-            torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
-        )
-
-        print(f"       📊 Tokenized shape: {tokenized['input_ids'].shape}")
-        print(f"       🔢 Sequence length: {tokenized['input_ids'].shape[1]}")
-        print(f"       🎯 Position IDs shape: {position_ids.shape}")
-
-        return {
-            "input_ids": tokenized["input_ids"],
-            "attention_mask": tokenized["attention_mask"],
-            "position_ids": position_ids,
-        }
+            self._clear_gpu_memory()
 
     def _get_intermediate_path(self, chunk_idx: int) -> Path:
         """Get the path for intermediate storage (same file reused for all stages)."""
@@ -659,86 +908,35 @@ class InferenceOrchestrator:
 
         return output_path
 
-    def _calculate_layer_groups(self) -> List[Tuple[int, int]]:
-        """Calculate optimal layer groupings based on available memory and utilization setting."""
+    def _get_intermediate_folder_size_gb(self) -> float:
+        """Get the current size of intermediate folder in GB."""
+        total_size = 0
         try:
-            memory_info = self._get_available_memory()
-            gpu_memory_gb = 0
-            if memory_info.get("available_gpus"):
-                gpu_memory_gb = memory_info["available_gpus"][0]["memoryFree"] / 1024
-        except:
-            gpu_memory_gb = 8
+            for file_path in self.intermediate_dir.glob("**/*"):
+                if file_path.is_file():
+                    total_size += file_path.stat().st_size
+        except Exception as e:
+            print(f"   ⚠️  Warning: Could not calculate folder size: {e}")
+            return 0.0
 
-        usable_memory_gb = gpu_memory_gb * self.memory_utilization
+        return total_size / (1024 * 1024 * 1024)
 
-        print(f"   🧠 Available GPU memory: {gpu_memory_gb:.1f} GB")
-        print(
-            f"   🧠 Usable memory ({self.memory_utilization*100:.1f}%): {usable_memory_gb:.1f} GB"
-        )
-
-        total_layers = self.model_config.total_layers
-
-        if usable_memory_gb > 16:
-            layers_per_group = min(8, total_layers)
-        elif usable_memory_gb > 8:
-            layers_per_group = min(4, total_layers)
-        elif usable_memory_gb > 4:
-            layers_per_group = min(2, total_layers)
-        elif usable_memory_gb > 2:
-            layers_per_group = 1
-        else:
-            layers_per_group = 1
-            print(
-                f"   ⚠️  Warning: Very low usable memory ({usable_memory_gb:.1f} GB). Consider increasing memory_utilization or reducing model size."
-            )
-
-        groups = []
-        for i in range(0, total_layers, layers_per_group):
-            end_layer = min(i + layers_per_group - 1, total_layers - 1)
-            groups.append((i, end_layer))
-
-        print(
-            f"   📊 Calculated {layers_per_group} layers per group based on {usable_memory_gb:.1f} GB usable memory"
-        )
-
-        return groups
-
-    def _get_available_memory(self) -> Dict[str, Any]:
-        """Fallback memory check if utility not available."""
-        return {
-            "available_ram": 16.0,
-            "available_disk": 100.0,
-            "available_gpus": [{"name": "GPU", "memoryFree": 8192}],
-        }
-
-    def _cleanup(self):
-        """Clean up resources and any remaining intermediate files."""
-        print("\n🧹 Cleaning up resources...")
-
-        self.data_pool.shutdown(wait=True)
-        self.model_pool.shutdown(wait=True)
-
+    def _cleanup_intermediate_files(self):
+        """Clean up all intermediate files after wave completion."""
+        cleaned_count = 0
         try:
-            cleaned_count = 0
-            for file_path in self.active_intermediate_files.copy():
-                if Path(file_path).exists():
-                    Path(file_path).unlink()
+            for file_path in self.intermediate_dir.glob("**/*"):
+                if file_path.is_file() and file_path.suffix == ".pkl":
+                    file_path.unlink()
                     cleaned_count += 1
-                self.active_intermediate_files.discard(file_path)
+
+            self.active_intermediate_files.clear()
 
             if cleaned_count > 0:
-                print(f"   🗑️  Removed {cleaned_count} remaining intermediate files")
-            else:
-                print(f"   ✅ No intermediate files to clean (already removed)")
+                print(f"     🗑️  Cleaned {cleaned_count} intermediate files")
 
         except Exception as e:
-            print(f"   ⚠️  Warning: Could not clean intermediate files: {e}")
-
-        print(f"   💽 Storage optimization: Wave-based disk space management")
-        print(f"   🔧 Context preservation: Maintained attention consistency")
-        print(
-            f"   🧠 Memory optimization: {self.memory_utilization*100:.1f}% GPU utilization"
-        )
+            print(f"     ⚠️  Warning: Could not clean intermediate files: {e}")
 
 
 def verify_orchestrator_output(final_output_path: str) -> tuple[Path, list[Path]]:
