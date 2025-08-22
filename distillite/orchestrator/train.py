@@ -8,6 +8,7 @@ from typing import Any, Dict, List
 import numpy as np
 import pandas as pd
 import torch
+from torch.optim import AdamW
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from distillite.data import DataConfig, DataLoader
@@ -139,6 +140,18 @@ class WaveTrainingOrchestrator:
 
     def _train_on_wave_results(self, wave_chunks: List[int], wave_number: int):
         """Train LoRA adapters on the results from completed wave."""
+
+        # Load previous wave's adapters if they exist
+        if wave_number > 1:
+            previous_wave_path = (
+                self.adapter_save_dir / f"wave_{wave_number-1}_adapters"
+            )
+            if previous_wave_path.exists():
+                print(
+                    f"     🔄 Loading adapters from previous wave: {previous_wave_path}"
+                )
+                self._load_previous_wave_adapters(previous_wave_path)
+
         # Collect chunk files from this wave
         chunk_files = []
         output_dir = Path(self.inference_orch.data_config.final_output_dir)
@@ -154,9 +167,9 @@ class WaveTrainingOrchestrator:
             print(f"     ❌ No chunk files found for training in wave {wave_number}")
             return
 
-        print(f"     📚 Training on {len(chunk_files)} chunk files...")
+        print(f"     📚 Continuing training on {len(chunk_files)} chunk files...")
 
-        # Run distillation training
+        # Run distillation training (continues from loaded adapters)
         try:
             training_metrics = self.distill_trainer.train_on_wave_outputs(
                 chunk_files=chunk_files,
@@ -175,6 +188,36 @@ class WaveTrainingOrchestrator:
 
         except Exception as e:
             print(f"     ❌ Training failed for wave {wave_number}: {e}")
+
+    def _load_previous_wave_adapters(self, adapter_path: Path):
+        """Load adapters from previous wave to continue training."""
+        from peft import PeftModel
+
+        try:
+            # Reload the base model with previous adapters
+            base_model = self.distill_trainer.model.get_base_model()
+
+            # Load the previous wave's trained adapters
+            self.distill_trainer.model = PeftModel.from_pretrained(
+                base_model, str(adapter_path)
+            )
+
+            # Ensure model is in training mode
+            self.distill_trainer.model.train()
+
+            # Recreate optimizer for the updated parameters
+            trainable_params = filter(
+                lambda p: p.requires_grad, self.distill_trainer.model.parameters()
+            )
+            self.distill_trainer.optimizer = AdamW(
+                trainable_params, lr=self.distill_trainer.learning_rate
+            )
+
+            print(f"     ✅ Successfully loaded previous wave adapters")
+
+        except Exception as e:
+            print(f"     ⚠️  Failed to load previous adapters: {e}")
+            print(f"     🔄 Continuing with fresh adapters for this wave")
 
     def cleanup(self):
         """Clean up both orchestrator and trainer."""
@@ -206,7 +249,7 @@ def test_wave_training_pipeline():
 
     # Wave training parameters
     memory_utilization = 0.3
-    intermediate_size_threshold_gb = 0.4  # Smaller for testing
+    intermediate_size_threshold_gb = 1  # Smaller for testing
     training_epochs_per_wave = 1
     training_batch_size = 2
     lora_rank = 8
