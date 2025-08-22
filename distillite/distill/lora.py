@@ -11,6 +11,9 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from torch.optim import AdamW
 from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 
+from distillite.data import DataConfig
+from distillite.model import ModelConfig
+
 
 class LoraDistillationTrainer:
     """
