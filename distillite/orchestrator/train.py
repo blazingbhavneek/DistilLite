@@ -55,7 +55,6 @@ class WaveTrainingOrchestrator:
         self.adapter_save_dir = Path(adapter_save_dir)
         self.adapter_save_dir.mkdir(parents=True, exist_ok=True)
 
-        # Prepare distillation model with orchestrator's tokenizer
         self.distill_trainer.prepare_model(self.inference_orch.executor.tokenizer)
 
         print(f"🌊 WaveTrainingOrchestrator initialized:")
@@ -73,7 +72,6 @@ class WaveTrainingOrchestrator:
         print("\n🚀 Starting integrated wave-based inference + training...")
         total_start = time.time()
 
-        # Modified inference orchestrator to support training integration
         final_output_path = self._run_modified_orchestrator_with_training(debug_first)
 
         total_time = time.time() - total_start
@@ -97,7 +95,6 @@ class WaveTrainingOrchestrator:
         Run orchestrator with training integration after each wave.
         This modifies the orchestrator's wave processing to include training.
         """
-        # Get orchestrator's layer groups and data info
         layer_groups = self.inference_orch._calculate_layer_groups()
         total_chunks = self.inference_orch.data_loader.num_chunks
         processed_chunks = 0
@@ -111,7 +108,6 @@ class WaveTrainingOrchestrator:
         while processed_chunks < total_chunks:
             print(f"\n🌊 WAVE {wave_number} - INFERENCE + TRAINING")
 
-            # Determine wave chunks
             wave_chunks = self.inference_orch._determine_wave_chunks(
                 processed_chunks, total_chunks
             )
@@ -119,7 +115,6 @@ class WaveTrainingOrchestrator:
 
             print(f"   📦 Processing chunks {processed_chunks}-{wave_end-1}")
 
-            # Run inference for this wave
             self.inference_orch._process_wave_through_all_stages(
                 wave_chunks, processed_chunks, layer_groups
             )
@@ -128,7 +123,6 @@ class WaveTrainingOrchestrator:
                 print(f"\n   🎓 TRAINING PHASE - Wave {wave_number}")
                 self._train_on_wave_results(wave_chunks, wave_number)
 
-            # Clean up inference intermediates
             self.inference_orch._cleanup_intermediate_files()
 
             processed_chunks = wave_end
@@ -141,7 +135,6 @@ class WaveTrainingOrchestrator:
     def _train_on_wave_results(self, wave_chunks: List[int], wave_number: int):
         """Train LoRA adapters on the results from completed wave."""
 
-        # Load previous wave's adapters if they exist
         if wave_number > 1:
             previous_wave_path = (
                 self.adapter_save_dir / f"wave_{wave_number-1}_adapters"
@@ -152,7 +145,6 @@ class WaveTrainingOrchestrator:
                 )
                 self._load_previous_wave_adapters(previous_wave_path)
 
-        # Collect chunk files from this wave
         chunk_files = []
         output_dir = Path(self.inference_orch.data_config.final_output_dir)
 
@@ -169,7 +161,6 @@ class WaveTrainingOrchestrator:
 
         print(f"     📚 Continuing training on {len(chunk_files)} chunk files...")
 
-        # Run distillation training (continues from loaded adapters)
         try:
             training_metrics = self.distill_trainer.train_on_wave_outputs(
                 chunk_files=chunk_files,
@@ -181,7 +172,6 @@ class WaveTrainingOrchestrator:
             print(f"     ✅ Wave {wave_number} training completed")
             print(f"     📊 Final loss: {training_metrics['avg_total_loss']:.4f}")
 
-            # Save adapters after training
             if self.save_adapters_after_training:
                 adapter_path = self.adapter_save_dir / f"wave_{wave_number}_adapters"
                 self.distill_trainer.save_trained_model(str(adapter_path))
@@ -194,18 +184,14 @@ class WaveTrainingOrchestrator:
         from peft import PeftModel
 
         try:
-            # Reload the base model with previous adapters
             base_model = self.distill_trainer.model.get_base_model()
 
-            # Load the previous wave's trained adapters
             self.distill_trainer.model = PeftModel.from_pretrained(
                 base_model, str(adapter_path)
             )
 
-            # Ensure model is in training mode
             self.distill_trainer.model.train()
 
-            # Recreate optimizer for the updated parameters
             trainable_params = filter(
                 lambda p: p.requires_grad, self.distill_trainer.model.parameters()
             )
@@ -233,7 +219,6 @@ def test_wave_training_pipeline():
     print("🧪 Testing Wave-Based LoRA Training Pipeline")
     print("=" * 80)
 
-    # Configuration - same as your original test
     local_model_dir = Path(__file__).resolve().parent.parent.parent / "models"
     project_root = Path(__file__).resolve().parent.parent
     csv_path = (
@@ -241,21 +226,18 @@ def test_wave_training_pipeline():
     )
     repo_id = "Qwen/Qwen3-0.6B"
 
-    # Training-specific configurations
-    chunk_size = 50  # Keep small for testing
+    chunk_size = 50
     batch_size = 4
     max_seq_length = 512
     use_qlora = False
 
-    # Wave training parameters
     memory_utilization = 0.3
-    intermediate_size_threshold_gb = 1  # Smaller for testing
+    intermediate_size_threshold_gb = 1
     training_epochs_per_wave = 1
     training_batch_size = 2
     lora_rank = 8
     learning_rate = 5e-5
 
-    # Directory setup
     base_output_dir = Path.cwd() / "wave_training_outputs"
     intermediate_dir = os.path.join(base_output_dir, "intermediate")
     final_output_dir = os.path.join(base_output_dir, "final_outputs")
@@ -272,11 +254,9 @@ def test_wave_training_pipeline():
     print(f"   ✅ Model dir: {local_model_dir}")
 
     try:
-        # Verify dataset exists
         if not os.path.exists(csv_path):
             raise FileNotFoundError(f"CSV file not found: {csv_path}")
 
-        # Preview dataset
         sample_df = pd.read_csv(csv_path, nrows=5)
         print(f"\n📊 Dataset preview:")
         print(f"   📁 File: {csv_path}")
@@ -288,7 +268,6 @@ def test_wave_training_pipeline():
             for i, text in enumerate(sample_df["context_text"].head(3)):
                 print(f"   {i+1}. {str(text)[:100]}...")
 
-        # Initialize data configuration
         print(f"\n🔧 Configuring pipeline components...")
 
         data_config = DataConfig(
@@ -303,21 +282,17 @@ def test_wave_training_pipeline():
         )
         print(f"   ✅ Data config created")
 
-        # Initialize data loader
         data_loader = DataLoader(data_config)
         print(f"   ✅ DataLoader initialized")
         print(f"      📊 Total rows: {data_loader.total_rows}")
         print(f"      📦 Number of chunks: {data_loader.num_chunks}")
 
-        # Initialize model configuration
         model_config = ModelConfig(local_model_dir, repo_id)
         print(f"   ✅ ModelConfig initialized")
 
-        # Initialize executor
         executor = Qwen3Executor(model_config)
         print(f"   ✅ Qwen3Executor initialized")
 
-        # Create inference orchestrator
         print(f"\n🚀 Creating inference orchestrator...")
 
         inference_orchestrator = InferenceOrchestrator(
@@ -332,13 +307,11 @@ def test_wave_training_pipeline():
         )
         print(f"   ✅ InferenceOrchestrator created")
 
-        # Create distillation trainer
         print(f"\n🎓 Creating distillation trainer...")
 
-        # Custom LoRA config for testing
         lora_config = {
             "r": lora_rank,
-            "lora_alpha": lora_rank * 2,  # Common practice: alpha = 2 * rank
+            "lora_alpha": lora_rank * 2,
             "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
             "lora_dropout": 0.05,
             "bias": "none",
@@ -348,10 +321,10 @@ def test_wave_training_pipeline():
         distillation_trainer = LoraDistillationTrainer(
             model_config=model_config,
             lora_config=lora_config,
-            use_qlora=use_qlora,  # Enable quantization for memory efficiency
+            use_qlora=use_qlora,
             learning_rate=learning_rate,
             temperature=2.0,
-            alpha=0.5,  # 50% hard labels, 50% soft labels
+            alpha=0.5,
             max_grad_norm=1.0,
         )
         print(f"   ✅ LoraDistillationTrainer created")
@@ -359,7 +332,6 @@ def test_wave_training_pipeline():
         print(f"      🔥 QLoRA enabled: True")
         print(f"      📚 Training epochs per wave: {training_epochs_per_wave}")
 
-        # Create wave training orchestrator
         print(f"\n🌊 Creating wave training orchestrator...")
 
         wave_orchestrator = WaveTrainingOrchestrator(
@@ -373,7 +345,6 @@ def test_wave_training_pipeline():
         )
         print(f"   ✅ WaveTrainingOrchestrator created")
 
-        # Run baseline comparison (optional - before training)
         print(f"\n🔍 Running baseline model comparison...")
         baseline_metrics = run_baseline_comparison(
             model_config, data_config, sample_size=10
@@ -381,18 +352,15 @@ def test_wave_training_pipeline():
         print(f"   📊 Baseline accuracy: {baseline_metrics['accuracy']:.1%}")
         print(f"   📊 Baseline avg loss: {baseline_metrics['avg_loss']:.4f}")
 
-        # Execute wave-based training pipeline
         print(f"\n🚀 Starting wave-based inference + training pipeline...")
         print(f"=" * 80)
 
         pipeline_start_time = time.time()
 
-        # Run the integrated pipeline
         results = wave_orchestrator.run_wave_based_training(debug_first=True)
 
         pipeline_time = time.time() - pipeline_start_time
 
-        # Verify pipeline completion
         if results is None or not results.get("final_output_path"):
             print("❌ Wave training pipeline failed.")
             return False
@@ -402,7 +370,6 @@ def test_wave_training_pipeline():
         print(f"   📁 Final outputs: {results['final_output_path']}")
         print(f"   🎯 Trained adapters: {results['adapter_save_path']}")
 
-        # Validate outputs and training results
         print(f"\n📊 Validating training results...")
         validation_results = validate_training_results(
             results["final_output_path"],
@@ -412,7 +379,6 @@ def test_wave_training_pipeline():
             baseline_metrics,
         )
 
-        # Print comprehensive results
         print_final_results(
             pipeline_time=pipeline_time,
             baseline_metrics=baseline_metrics,
@@ -426,7 +392,6 @@ def test_wave_training_pipeline():
             },
         )
 
-        # Cleanup
         print(f"\n🧹 Cleaning up resources...")
         wave_orchestrator.cleanup()
         del wave_orchestrator, inference_orchestrator, distillation_trainer
@@ -448,7 +413,6 @@ def run_baseline_comparison(
     """
     print(f"   🔄 Loading baseline model for comparison...")
 
-    # Load original model and tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
         model_config.model_path, trust_remote_code=True
     )
@@ -459,7 +423,6 @@ def run_baseline_comparison(
         model_config.model_path, trust_remote_code=True, torch_dtype=torch.float32
     ).eval()
 
-    # Load sample data
     sample_df = pd.read_csv(data_config.csv_path, nrows=sample_size)
 
     correct_predictions = 0
@@ -470,7 +433,6 @@ def run_baseline_comparison(
             context_text = row[data_config.input_col]
             actual_next_token = row.get("next_token", None)
 
-            # Tokenize
             inputs = tokenizer(
                 context_text,
                 return_tensors="pt",
@@ -479,24 +441,20 @@ def run_baseline_comparison(
                 max_length=512,
             )
 
-            # Get predictions
             outputs = model(**inputs)
             logits = outputs.logits[0, -1, :].cpu().numpy()
             predicted_token = np.argmax(logits)
 
-            # Calculate accuracy
             if actual_next_token is not None:
                 if int(predicted_token) == actual_next_token:
                     correct_predictions += 1
 
-            # Calculate loss (if we have true labels)
             if actual_next_token is not None:
                 loss = torch.nn.functional.cross_entropy(
                     torch.tensor(logits).unsqueeze(0), torch.tensor([actual_next_token])
                 ).item()
                 total_loss += loss
 
-    # Cleanup
     del model, tokenizer
     gc.collect()
 
@@ -523,7 +481,6 @@ def validate_training_results(
     """
     print(f"   🔍 Loading and validating training outputs...")
 
-    # Check if output files exist
     output_dir = Path(final_output_path)
     adapter_dir = Path(adapter_save_path)
 
@@ -538,7 +495,6 @@ def validate_training_results(
         "training_progression": [],
     }
 
-    # Count total samples processed
     total_samples = 0
     for chunk_file in chunk_files:
         chunk_df = pd.read_csv(chunk_file)
@@ -546,7 +502,6 @@ def validate_training_results(
 
     validation_results["total_training_samples"] = total_samples
 
-    # Validate adapter checkpoints exist
     for adapter_subdir in sorted(adapter_subdirs):
         adapter_files = list(adapter_subdir.glob("*.bin")) + list(
             adapter_subdir.glob("*.safetensors")
@@ -564,7 +519,6 @@ def validate_training_results(
             }
         )
 
-    # Test trained model performance (if we have a recent checkpoint)
     if adapter_subdirs:
         latest_adapter = sorted(adapter_subdirs)[-1]
         print(f"   🧪 Testing performance of latest adapter: {latest_adapter.name}")
@@ -578,7 +532,7 @@ def validate_training_results(
                 "accuracy_delta": trained_metrics["accuracy"]
                 - baseline_metrics["accuracy"],
                 "loss_delta": baseline_metrics["avg_loss"]
-                - trained_metrics["avg_loss"],  # Lower is better
+                - trained_metrics["avg_loss"],
             }
         except Exception as e:
             print(f"     ⚠️  Could not test trained model: {e}")
@@ -600,7 +554,6 @@ def test_trained_model_performance(
     from peft import PeftModel
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    # Load base model
     tokenizer = AutoTokenizer.from_pretrained(
         model_config.model_path, trust_remote_code=True
     )
@@ -611,10 +564,8 @@ def test_trained_model_performance(
         model_config.model_path, trust_remote_code=True, torch_dtype=torch.float32
     ).eval()
 
-    # Load trained adapter
     model_with_adapter = PeftModel.from_pretrained(base_model, str(adapter_path))
 
-    # Load sample data
     sample_df = pd.read_csv(data_config.csv_path, nrows=sample_size)
 
     correct_predictions = 0
@@ -625,7 +576,6 @@ def test_trained_model_performance(
             context_text = row[data_config.input_col]
             actual_next_token = row.get("next_token", None)
 
-            # Tokenize
             inputs = tokenizer(
                 context_text,
                 return_tensors="pt",
@@ -634,24 +584,20 @@ def test_trained_model_performance(
                 max_length=512,
             )
 
-            # Get predictions with adapter
             outputs = model_with_adapter(**inputs)
             logits = outputs.logits[0, -1, :].cpu().numpy()
             predicted_token = np.argmax(logits)
 
-            # Calculate accuracy
             if actual_next_token is not None:
                 if int(predicted_token) == actual_next_token:
                     correct_predictions += 1
 
-            # Calculate loss
             if actual_next_token is not None:
                 loss = torch.nn.functional.cross_entropy(
                     torch.tensor(logits).unsqueeze(0), torch.tensor([actual_next_token])
                 ).item()
                 total_loss += loss
 
-    # Cleanup
     del model_with_adapter, base_model, tokenizer
     gc.collect()
 
@@ -678,7 +624,6 @@ def print_final_results(
     print(f"\n🎉 WAVE-BASED LORA TRAINING PIPELINE RESULTS")
     print(f"=" * 80)
 
-    # Pipeline summary
     print(f"📊 Pipeline Summary:")
     print(f"   ⏱️  Total execution time: {pipeline_time:.2f}s")
     print(f"   🌊 Waves completed: {validation_results['waves_completed']}")
@@ -690,12 +635,10 @@ def print_final_results(
         f"   🎯 Adapter checkpoints: {validation_results['adapter_checkpoints_found']}"
     )
 
-    # Training configuration
     print(f"\n🔧 Training Configuration:")
     for key, value in training_config.items():
         print(f"   {key}: {value}")
 
-    # Baseline vs trained comparison
     print(f"\n📈 Model Performance Comparison:")
     print(f"   📊 Baseline accuracy: {baseline_metrics['accuracy']:.1%}")
     if validation_results.get("trained_model_metrics"):
@@ -710,16 +653,15 @@ def print_final_results(
         print(f"   📈 Accuracy improvement: {improvement['accuracy_delta']:+.1%}")
         print(f"   📉 Loss reduction: {improvement['loss_delta']:+.4f}")
 
-        if improvement["accuracy_delta"] > 0.05:  # 5% improvement
+        if improvement["accuracy_delta"] > 0.05:
             print(f"   ✅ EXCELLENT: Significant accuracy improvement!")
-        elif improvement["accuracy_delta"] > 0.01:  # 1% improvement
+        elif improvement["accuracy_delta"] > 0.01:
             print(f"   ✅ GOOD: Noticeable accuracy improvement!")
         else:
             print(f"   ⚠️  Modest improvements - may need more training")
     else:
         print(f"   ❌ Could not evaluate trained model performance")
 
-    # Wave progression
     print(f"\n🌊 Wave Training Progression:")
     for i, wave_info in enumerate(validation_results["training_progression"]):
         status = "✅" if wave_info["checkpoint_valid"] else "❌"
@@ -727,7 +669,6 @@ def print_final_results(
             f"   {status} {wave_info['wave']}: {wave_info['adapter_files']} adapter files"
         )
 
-    # Memory and efficiency metrics
     print(f"\n💾 Efficiency Metrics:")
     if training_config["use_qlora"]:
         print(f"   🔥 QLoRA quantization: Enabled (4-bit)")

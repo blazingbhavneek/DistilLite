@@ -28,7 +28,7 @@ class LoraDistillationTrainer:
         use_qlora: bool = True,
         learning_rate: float = 5e-5,
         temperature: float = 2.0,
-        alpha: float = 0.5,  # Weight for KL vs CE loss
+        alpha: float = 0.5,
         max_grad_norm: float = 1.0,
         device: str = "auto",
     ):
@@ -51,7 +51,6 @@ class LoraDistillationTrainer:
         self.alpha = alpha
         self.max_grad_norm = max_grad_norm
 
-        # Default LoRA config optimized for distillation
         self.lora_config = lora_config or {
             "r": 8,
             "lora_alpha": 32,
@@ -86,12 +85,11 @@ class LoraDistillationTrainer:
         self.tokenizer = tokenizer
 
         if self.use_qlora:
-            # QLoRA: 4-bit quantization + LoRA
             bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_compute_dtype=torch.bfloat16,
-                bnb_4bit_use_double_quant=True,  # Nested quantization for memory
+                bnb_4bit_use_double_quant=True,
             )
 
             model = AutoModelForCausalLM.from_pretrained(
@@ -102,12 +100,10 @@ class LoraDistillationTrainer:
                 torch_dtype=torch.bfloat16,
             )
 
-            # Prepare for k-bit training
             model = prepare_model_for_kbit_training(model)
             print("   ✅ 4-bit quantization enabled")
 
         else:
-            # Regular LoRA without quantization
             model = AutoModelForCausalLM.from_pretrained(
                 self.model_config.model_path,
                 device_map="auto",
@@ -116,15 +112,12 @@ class LoraDistillationTrainer:
             )
             print("   ✅ Standard precision model loaded")
 
-        # Apply LoRA configuration
         lora_config = LoraConfig(**self.lora_config)
         self.model = get_peft_model(model, lora_config)
 
-        # Setup optimizer for ONLY trainable parameters
         trainable_params = filter(lambda p: p.requires_grad, self.model.parameters())
         self.optimizer = AdamW(trainable_params, lr=self.learning_rate)
 
-        # Print trainable parameter info
         total_params = sum(p.numel() for p in self.model.parameters())
         trainable_params_count = sum(
             p.numel() for p in self.model.parameters() if p.requires_grad
@@ -164,7 +157,6 @@ class LoraDistillationTrainer:
         print(f"   📚 Epochs: {epochs}")
         print(f"   📦 Batch size: {batch_size}")
 
-        # Load all training data
         training_data = []
         for chunk_file in chunk_files:
             chunk_df = pd.read_csv(chunk_file)
@@ -173,7 +165,6 @@ class LoraDistillationTrainer:
         combined_df = pd.concat(training_data, ignore_index=True)
         print(f"   📊 Total training samples: {len(combined_df)}")
 
-        # Training metrics
         total_loss = 0.0
         total_kl_loss = 0.0
         total_ce_loss = 0.0
@@ -185,14 +176,12 @@ class LoraDistillationTrainer:
             print(f"\n📖 Epoch {epoch + 1}/{epochs}")
             epoch_start = time.time()
 
-            # Shuffle data
             shuffled_df = combined_df.sample(frac=1.0).reset_index(drop=True)
 
             for batch_start in range(0, len(shuffled_df), batch_size):
                 batch_end = min(batch_start + batch_size, len(shuffled_df))
                 batch_df = shuffled_df.iloc[batch_start:batch_end]
 
-                # Prepare batch
                 batch_loss, batch_kl, batch_ce = self._train_batch(
                     batch_df, data_config
                 )
@@ -210,7 +199,6 @@ class LoraDistillationTrainer:
             epoch_time = time.time() - epoch_start
             print(f"   ⏱️  Epoch {epoch + 1} completed in {epoch_time:.2f}s")
 
-        # Calculate final metrics
         avg_loss = total_loss / total_batches
         avg_kl = total_kl_loss / total_batches
         avg_ce = total_ce_loss / total_batches
@@ -238,21 +226,18 @@ class LoraDistillationTrainer:
         """Train on a single batch of examples."""
         self.optimizer.zero_grad()
 
-        # Extract input texts and teacher logits
         input_texts = batch_df[data_config.input_col].tolist()
         teacher_logits_list = []
 
         for _, row in batch_df.iterrows():
             logits_str = row[data_config.output_col]
             if isinstance(logits_str, str):
-                # Parse string representation of logits
                 logits_clean = logits_str.strip("[]")
                 logits = np.array([float(x.strip()) for x in logits_clean.split(",")])
             else:
                 logits = np.array(logits_str)
             teacher_logits_list.append(torch.tensor(logits, dtype=torch.float32))
 
-        # Tokenize inputs
         tokenized = self.tokenizer(
             input_texts,
             return_tensors="pt",
@@ -261,37 +246,28 @@ class LoraDistillationTrainer:
             max_length=512,
         ).to(self.model.device)
 
-        # Stack teacher logits
         teacher_logits = torch.stack(teacher_logits_list).to(self.model.device)
 
-        # Forward pass - get logits at final position
         outputs = self.model(**tokenized)
-        student_logits = outputs.logits[:, -1, :]  # Only final token logits
+        student_logits = outputs.logits[:, -1, :]
 
-        # Calculate losses
         T = self.temperature
 
-        # KL divergence loss (soft targets)
         student_log_probs = F.log_softmax(student_logits / T, dim=-1)
         teacher_probs = F.softmax(teacher_logits / T, dim=-1)
         kl_loss = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean") * (
             T * T
         )
 
-        # Cross-entropy loss (hard targets) - using teacher's predicted tokens
         teacher_tokens = torch.argmax(teacher_logits, dim=-1)
         ce_loss = F.cross_entropy(student_logits, teacher_tokens)
 
-        # Combined loss
         total_loss = self.alpha * ce_loss + (1 - self.alpha) * kl_loss
 
-        # Backward pass
         total_loss.backward()
 
-        # Gradient clipping
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
-        # Optimizer step
         self.optimizer.step()
 
         return total_loss.item(), kl_loss.item(), ce_loss.item()
